@@ -1,21 +1,28 @@
-// test_commands.cpp — Verify GET, SET, DEL functionality
+// test_commands.cpp — Chapter 9: Verify typed serialization for GET, SET, DEL, EXISTS, KEYS.
+//
+// This test was rewritten for the new typed response format. Instead of
+// checking (status, string) pairs, we now check (type_tag, typed_value) tuples.
+//
+// The test infrastructure deserializes responses and verifies both the type
+// and the value, which catches mismatches like "DEL returning a string '1'
+// instead of integer 1" that the old tests couldn't distinguish.
+
 #define WIN32_LEAN_AND_MEAN
+#ifndef __USE_MINGW_ANSI_STDIO
+#define __USE_MINGW_ANSI_STDIO 1
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cinttypes>
 #include <vector>
 #include <string>
+#include "../src/serialization.h"
 
 static const size_t k_max_msg = 4096;
-
-enum {
-    RES_OK = 0,
-    RES_ERR = 1,
-    RES_NX = 2,
-};
 
 static void die(const char *msg) {
     fprintf(stderr, "[FAIL] %s (WSA error: %d)\n", msg, WSAGetLastError());
@@ -63,52 +70,174 @@ static int send_request(SOCKET fd, const std::vector<std::string> &cmd) {
     return 0;
 }
 
-static int read_response(SOCKET fd, uint32_t &out_status, std::string &out_data) {
+// Read the raw response payload (after the 4-byte outer length header).
+static int read_response_raw(SOCKET fd, std::vector<uint8_t> &out) {
     char header[4];
     if (read_full(fd, header, 4) != 0) return -1;
 
     uint32_t len = 0;
     memcpy(&len, header, 4);
-    if (len > k_max_msg || len < 4) return -1;
+    if (len > k_max_msg) return -1;
 
-    if (read_full(fd, (char*)&out_status, 4) != 0) return -1;
-
-    uint32_t data_len = len - 4;
-    if (data_len > 0) {
-        std::vector<char> buf(data_len);
-        if (read_full(fd, buf.data(), data_len) != 0) return -1;
-        out_data.assign(buf.data(), data_len);
-    } else {
-        out_data.clear();
+    out.resize(len);
+    if (len > 0) {
+        if (read_full(fd, (char*)out.data(), len) != 0) return -1;
     }
     return 0;
 }
 
-static int run_test(SOCKET fd, const std::vector<std::string> &cmd, uint32_t expected_status, const std::string &expected_data) {
-    if (send_request(fd, cmd) != 0) {
-        printf("[FAIL] Failed to send request\n");
-        return 1;
-    }
+// --------------------------------------------------------------------------
+// Test helpers for typed responses
+// --------------------------------------------------------------------------
 
-    uint32_t status;
-    std::string data;
-    if (read_response(fd, status, data) != 0) {
-        printf("[FAIL] Failed to read response\n");
-        return 1;
-    }
+static void print_cmd(const std::vector<std::string> &cmd) {
+    for (const auto &s : cmd) printf("%s ", s.c_str());
+}
 
-    if (status != expected_status) {
-        printf("[FAIL] Expected status %u, got %u\n", expected_status, status);
-        return 1;
-    }
+// Expect a NIL response.
+static int test_nil(SOCKET fd, const std::vector<std::string> &cmd) {
+    if (send_request(fd, cmd) != 0) { printf("[FAIL] send\n"); return 1; }
+    std::vector<uint8_t> resp;
+    if (read_response_raw(fd, resp) != 0) { printf("[FAIL] recv\n"); return 1; }
 
-    if (data != expected_data) {
-        printf("[FAIL] Expected data '%s', got '%s'\n", expected_data.c_str(), data.c_str());
+    if (resp.size() < 1 || resp[0] != SER_NIL) {
+        printf("[FAIL] Expected NIL, got tag %u — ", resp.empty() ? 255 : resp[0]);
+        print_cmd(cmd);
+        printf("\n");
         return 1;
     }
-    
-    printf("[PASS] command ");
-    for(const auto& s : cmd) printf("%s ", s.c_str());
+    printf("[PASS] (nil)  ");
+    print_cmd(cmd);
+    printf("\n");
+    return 0;
+}
+
+// Expect a string response with a specific value.
+static int test_str(SOCKET fd, const std::vector<std::string> &cmd, const std::string &expected) {
+    if (send_request(fd, cmd) != 0) { printf("[FAIL] send\n"); return 1; }
+    std::vector<uint8_t> resp;
+    if (read_response_raw(fd, resp) != 0) { printf("[FAIL] recv\n"); return 1; }
+
+    const uint8_t *data = resp.data();
+    size_t len = resp.size();
+    uint8_t tag;
+    if (!read_u8(data, len, tag) || tag != SER_STR) {
+        printf("[FAIL] Expected STR, got tag %u — ", tag);
+        print_cmd(cmd);
+        printf("\n");
+        return 1;
+    }
+    std::string val;
+    if (!read_str(data, len, val)) {
+        printf("[FAIL] Malformed STR payload — ");
+        print_cmd(cmd);
+        printf("\n");
+        return 1;
+    }
+    if (val != expected) {
+        printf("[FAIL] Expected str '%s', got '%s' — ", expected.c_str(), val.c_str());
+        print_cmd(cmd);
+        printf("\n");
+        return 1;
+    }
+    printf("[PASS] (str) \"%s\"  ", val.c_str());
+    print_cmd(cmd);
+    printf("\n");
+    return 0;
+}
+
+// Expect an integer response with a specific value.
+static int test_int(SOCKET fd, const std::vector<std::string> &cmd, int64_t expected) {
+    if (send_request(fd, cmd) != 0) { printf("[FAIL] send\n"); return 1; }
+    std::vector<uint8_t> resp;
+    if (read_response_raw(fd, resp) != 0) { printf("[FAIL] recv\n"); return 1; }
+
+    const uint8_t *data = resp.data();
+    size_t len = resp.size();
+    uint8_t tag;
+    if (!read_u8(data, len, tag) || tag != SER_INT) {
+        printf("[FAIL] Expected INT, got tag %u — ", tag);
+        print_cmd(cmd);
+        printf("\n");
+        return 1;
+    }
+    int64_t val;
+    if (!read_i64(data, len, val)) {
+        printf("[FAIL] Malformed INT payload — ");
+        print_cmd(cmd);
+        printf("\n");
+        return 1;
+    }
+    if (val != expected) {
+        printf("[FAIL] Expected int %" PRId64 ", got %" PRId64 " — ", expected, val);
+        print_cmd(cmd);
+        printf("\n");
+        return 1;
+    }
+    printf("[PASS] (int) %" PRId64 "  ", val);
+    print_cmd(cmd);
+    printf("\n");
+    return 0;
+}
+
+// Expect an error response (any error code, check message substring).
+static int test_err(SOCKET fd, const std::vector<std::string> &cmd, const std::string &msg_substr) {
+    if (send_request(fd, cmd) != 0) { printf("[FAIL] send\n"); return 1; }
+    std::vector<uint8_t> resp;
+    if (read_response_raw(fd, resp) != 0) { printf("[FAIL] recv\n"); return 1; }
+
+    const uint8_t *data = resp.data();
+    size_t len = resp.size();
+    uint8_t tag;
+    if (!read_u8(data, len, tag) || tag != SER_ERR) {
+        printf("[FAIL] Expected ERR, got tag %u — ", tag);
+        print_cmd(cmd);
+        printf("\n");
+        return 1;
+    }
+    uint32_t code;
+    if (!read_u32(data, len, code)) return 1;
+    std::string msg;
+    if (!read_str(data, len, msg)) return 1;
+
+    if (msg.find(msg_substr) == std::string::npos) {
+        printf("[FAIL] Expected error containing '%s', got '%s' — ", msg_substr.c_str(), msg.c_str());
+        print_cmd(cmd);
+        printf("\n");
+        return 1;
+    }
+    printf("[PASS] (err) %u %s  ", code, msg.c_str());
+    print_cmd(cmd);
+    printf("\n");
+    return 0;
+}
+
+// Expect an array response of a specific length (don't check contents).
+static int test_arr_len(SOCKET fd, const std::vector<std::string> &cmd, uint32_t expected_len) {
+    if (send_request(fd, cmd) != 0) { printf("[FAIL] send\n"); return 1; }
+    std::vector<uint8_t> resp;
+    if (read_response_raw(fd, resp) != 0) { printf("[FAIL] recv\n"); return 1; }
+
+    const uint8_t *data = resp.data();
+    size_t len = resp.size();
+    uint8_t tag;
+    if (!read_u8(data, len, tag) || tag != SER_ARR) {
+        printf("[FAIL] Expected ARR, got tag %u — ", tag);
+        print_cmd(cmd);
+        printf("\n");
+        return 1;
+    }
+    uint32_t count;
+    if (!read_u32(data, len, count)) return 1;
+
+    if (count != expected_len) {
+        printf("[FAIL] Expected arr len %u, got %u — ", expected_len, count);
+        print_cmd(cmd);
+        printf("\n");
+        return 1;
+    }
+    printf("[PASS] (arr) len=%u  ", count);
+    print_cmd(cmd);
     printf("\n");
     return 0;
 }
@@ -131,48 +260,63 @@ int main() {
 
     int failures = 0;
 
-    // Test 1: GET non-existent key
-    failures += run_test(fd, {"GET", "key1"}, RES_NX, "");
+    printf("=== Typed Serialization Tests (Chapter 9) ===\n\n");
 
-    // Test 2: SET key
-    failures += run_test(fd, {"SET", "key1", "val1"}, RES_OK, "OK");
+    // Test 1: GET non-existent key → NIL
+    failures += test_nil(fd, {"GET", "key1"});
 
-    // Test 3: GET existing key
-    failures += run_test(fd, {"GET", "key1"}, RES_OK, "val1");
+    // Test 2: SET key → STR "OK"
+    failures += test_str(fd, {"SET", "key1", "val1"}, "OK");
 
-    // Test 4: DEL key
-    failures += run_test(fd, {"DEL", "key1"}, RES_OK, "1");
+    // Test 3: GET existing key → STR "val1"
+    failures += test_str(fd, {"GET", "key1"}, "val1");
 
-    // Test 5: GET deleted key
-    failures += run_test(fd, {"GET", "key1"}, RES_NX, "");
+    // Test 4: DEL key → INT 1  (not string "1"!)
+    failures += test_int(fd, {"DEL", "key1"}, 1);
 
-    // Test 6: DEL non-existent key
-    failures += run_test(fd, {"DEL", "key1"}, RES_OK, "0");
+    // Test 5: GET deleted key → NIL
+    failures += test_nil(fd, {"GET", "key1"});
 
-    // Test 7: Invalid command
-    failures += run_test(fd, {"FOO"}, RES_ERR, "ERR unknown command");
+    // Test 6: DEL non-existent key → INT 0
+    failures += test_int(fd, {"DEL", "key1"}, 0);
 
-    // Test 8: SET wrong arguments
-    failures += run_test(fd, {"SET", "k"}, RES_ERR, "ERR wrong number of arguments for 'set' command");
+    // Test 7: Invalid command → ERR
+    failures += test_err(fd, {"FOO"}, "unknown command");
 
-    // Test 9: EXISTS on non-existent key
-    failures += run_test(fd, {"EXISTS", "nokey"}, RES_OK, "0");
+    // Test 8: SET wrong arguments → ERR
+    failures += test_err(fd, {"SET", "k"}, "wrong number of arguments");
 
-    // Test 10: SET then EXISTS
-    failures += run_test(fd, {"SET", "ekey", "eval"}, RES_OK, "OK");
-    failures += run_test(fd, {"EXISTS", "ekey"}, RES_OK, "1");
+    // Test 9: EXISTS on non-existent key → INT 0
+    failures += test_int(fd, {"EXISTS", "nokey"}, 0);
 
-    // Test 11: DEL then EXISTS
-    failures += run_test(fd, {"DEL", "ekey"}, RES_OK, "1");
-    failures += run_test(fd, {"EXISTS", "ekey"}, RES_OK, "0");
+    // Test 10: SET then EXISTS → INT 1
+    failures += test_str(fd, {"SET", "ekey", "eval"}, "OK");
+    failures += test_int(fd, {"EXISTS", "ekey"}, 1);
 
-    // Test 12: EXISTS wrong number of arguments
-    failures += run_test(fd, {"EXISTS"}, RES_ERR, "ERR wrong number of arguments for 'exists' command");
+    // Test 11: DEL then EXISTS → INT 0
+    failures += test_int(fd, {"DEL", "ekey"}, 1);
+    failures += test_int(fd, {"EXISTS", "ekey"}, 0);
 
+    // Test 12: EXISTS wrong number of arguments → ERR
+    failures += test_err(fd, {"EXISTS"}, "wrong number of arguments");
+
+    // Test 13: KEYS on empty store → ARR len=0
+    failures += test_arr_len(fd, {"KEYS"}, 0);
+
+    // Test 14: SET two keys, then KEYS → ARR len=2
+    failures += test_str(fd, {"SET", "k1", "v1"}, "OK");
+    failures += test_str(fd, {"SET", "k2", "v2"}, "OK");
+    failures += test_arr_len(fd, {"KEYS"}, 2);
+
+    // Clean up test keys
+    failures += test_int(fd, {"DEL", "k1"}, 1);
+    failures += test_int(fd, {"DEL", "k2"}, 1);
+
+    printf("\n");
     if (failures == 0) {
-        printf("\nAll KV commands tests passed!\n");
+        printf("All typed serialization tests passed!\n");
     } else {
-        printf("\n%d tests failed.\n", failures);
+        printf("%d tests failed.\n", failures);
     }
 
     closesocket(fd);
