@@ -27,6 +27,10 @@
 #define _WIN32_WINNT 0x0600
 #endif
 
+#ifndef __USE_MINGW_ANSI_STDIO
+#define __USE_MINGW_ANSI_STDIO 1
+#endif
+
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -34,10 +38,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <chrono>
 #include <vector>
 #include <string>
 #include "hashtable.h"
 #include "serialization.h"
+#include "zset.h"
+#include "dlist.h"
 
 // --------------------------------------------------------------------------
 // WSAPoll compatibility shim for MinGW.
@@ -90,11 +97,25 @@ enum {
 // --------------------------------------------------------------------------
 // Global key-value store — backed by our custom HMap hashtable.
 // --------------------------------------------------------------------------
+enum {
+    T_STR = 0,
+    T_ZSET = 1,
+};
+
 struct Entry {
     HNode  node;           // intrusive hash node (must be a member, not a pointer)
     std::string key;
-    std::string val;
+    uint32_t type = 0;
+    std::string val;       // for T_STR
+    ZSet *zset = NULL;     // for T_ZSET
 };
+
+static void entry_destroy(Entry *ent) {
+    if (ent->type == T_ZSET) {
+        zset_destroy(ent->zset);
+        delete ent->zset;
+    }
+}
 
 // FNV-1a hash
 static uint64_t str_hash(const std::string &s) {
@@ -140,7 +161,76 @@ struct Conn {
     uint8_t  wbuf[4 + k_max_msg];
     size_t   wbuf_size;     // total bytes in wbuf that need to be sent
     size_t   wbuf_sent;     // bytes already sent
+
+    // Idle timer tracking
+    uint64_t idle_start;    // timestamp in microseconds of last IO activity
+    DList    idle_list;     // intrusive doubly-linked list node in g_idle_list
 };
+
+// --------------------------------------------------------------------------
+// Idle timers and timeouts (Chapter 12)
+// --------------------------------------------------------------------------
+static const uint64_t k_idle_timeout_us = 5ULL * 1000 * 1000; // 5 seconds
+
+// Global intrusive list of all active connections, ordered by idle_start
+// with the oldest (soonest-to-expire) connection always at g_idle_list.next.
+static DList g_idle_list = {};
+
+// Monotonic clock reading in microseconds
+static uint64_t get_monotonic_usec() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+}
+
+// Update last active timestamp and move connection to the tail of g_idle_list
+static void conn_touch(Conn *conn) {
+    conn->idle_start = get_monotonic_usec();
+    dlist_detach(&conn->idle_list);
+    dlist_insert_before(&g_idle_list, &conn->idle_list);
+}
+
+// Compute dynamic poll timeout: milliseconds until the earliest timeout fires
+static int next_timer_ms() {
+    uint64_t now_us = get_monotonic_usec();
+    uint64_t next_us = (uint64_t)-1;
+
+    // The connection needing to time out soonest is always at head (g_idle_list.next)
+    if (!dlist_empty(&g_idle_list)) {
+        Conn *conn = container_of(g_idle_list.next, Conn, idle_list);
+        next_us = conn->idle_start + k_idle_timeout_us;
+    }
+
+    if (next_us == (uint64_t)-1) {
+        return 10000; // default wait when no connections exist
+    }
+
+    if (next_us <= now_us) {
+        return 0; // earliest deadline has passed; do not block in poll
+    }
+
+    // Convert microsecond delta to millisecond timeout, rounding up
+    return (int)((next_us - now_us + 999) / 1000);
+}
+
+// Timeout sweep: close any connections whose idle duration >= k_idle_timeout_us
+static void process_timers() {
+    uint64_t now_us = get_monotonic_usec();
+    while (!dlist_empty(&g_idle_list)) {
+        Conn *conn = container_of(g_idle_list.next, Conn, idle_list);
+        uint64_t next_us = conn->idle_start + k_idle_timeout_us;
+        if (next_us > now_us) {
+            // Because connections are ordered monotonically by idle_start,
+            // if the head has not timed out, no subsequent connection has either.
+            break;
+        }
+        printf("Connection fd=%u timed out after %u ms idle.\n",
+               (unsigned)conn->fd,
+               (unsigned)((now_us - conn->idle_start) / 1000));
+        conn->want_close = true;
+        dlist_detach(&conn->idle_list);
+    }
+}
 
 static void die(const char *msg) {
     fprintf(stderr, "[error] %s (WSA error: %d)\n", msg, WSAGetLastError());
@@ -222,6 +312,10 @@ static void do_get(const std::vector<std::string> &cmd, std::vector<uint8_t> &ou
         out_nil(out);
     } else {
         Entry *ent = container_of(node, Entry, node);
+        if (ent->type != T_STR) {
+            out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+            return;
+        }
         out_str(out, ent->val);
     }
 }
@@ -240,11 +334,16 @@ static void do_set(const std::vector<std::string> &cmd, std::vector<uint8_t> &ou
     if (node) {
         // Key exists — update value in place
         Entry *ent = container_of(node, Entry, node);
+        if (ent->type != T_STR) {
+            out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+            return;
+        }
         ent->val = cmd[2];
     } else {
         // Key doesn't exist — allocate a new Entry and insert
         Entry *ent = new Entry();
         ent->key = cmd[1];
+        ent->type = T_STR;
         ent->val = cmd[2];
         ent->node.hcode = key.node.hcode;
         hm_insert(&g_map, &ent->node);
@@ -271,6 +370,7 @@ static void do_del(const std::vector<std::string> &cmd, std::vector<uint8_t> &ou
         out_int(out, 0);
     } else {
         Entry *ent = container_of(node, Entry, node);
+        entry_destroy(ent);
         delete ent;
         // Deleted 1 key — return integer 1.
         out_int(out, 1);
@@ -345,6 +445,174 @@ static void do_keys(const std::vector<std::string> &cmd, std::vector<uint8_t> &o
 }
 
 // --------------------------------------------------------------------------
+// ZSet commands
+// --------------------------------------------------------------------------
+
+static void do_zadd(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+    if (cmd.size() != 4) {
+        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zadd' command");
+        return;
+    }
+    double score = 0;
+    try {
+        score = std::stod(cmd[2]);
+    } catch (...) {
+        out_err(out, ERR_BADARGS, "ERR value is not a valid float");
+        return;
+    }
+    
+    Entry key;
+    key.node.hcode = str_hash(cmd[1]);
+    key.key = cmd[1];
+
+    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
+    Entry *ent = NULL;
+    if (!node) {
+        ent = new Entry();
+        ent->key = cmd[1];
+        ent->node.hcode = key.node.hcode;
+        ent->type = T_ZSET;
+        ent->zset = new ZSet();
+        zset_init(ent->zset);
+        hm_insert(&g_map, &ent->node);
+    } else {
+        ent = container_of(node, Entry, node);
+        if (ent->type != T_ZSET) {
+            out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+            return;
+        }
+    }
+    
+    bool added = zset_add(ent->zset, cmd[3].data(), cmd[3].size(), score);
+    out_int(out, added ? 1 : 0);
+}
+
+static void do_zscore(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+    if (cmd.size() != 3) {
+        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zscore' command");
+        return;
+    }
+    
+    Entry key;
+    key.node.hcode = str_hash(cmd[1]);
+    key.key = cmd[1];
+
+    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
+    if (!node) {
+        out_nil(out);
+        return;
+    }
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type != T_ZSET) {
+        out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        return;
+    }
+    
+    ZNode *zn = zset_lookup(ent->zset, cmd[2].data(), cmd[2].size());
+    if (zn) {
+        out_dbl(out, zn->score);
+    } else {
+        out_nil(out);
+    }
+}
+
+static void do_zrem(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+    if (cmd.size() != 3) {
+        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zrem' command");
+        return;
+    }
+    Entry key;
+    key.node.hcode = str_hash(cmd[1]);
+    key.key = cmd[1];
+    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
+    if (!node) {
+        out_int(out, 0);
+        return;
+    }
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type != T_ZSET) {
+        out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        return;
+    }
+    
+    ZNode *zn = zset_pop(ent->zset, cmd[2].data(), cmd[2].size());
+    if (zn) {
+        delete zn;
+        out_int(out, 1);
+    } else {
+        out_int(out, 0);
+    }
+}
+
+static void do_zrank(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+    if (cmd.size() != 3) {
+        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zrank' command");
+        return;
+    }
+    Entry key;
+    key.node.hcode = str_hash(cmd[1]);
+    key.key = cmd[1];
+    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
+    if (!node) {
+        out_nil(out);
+        return;
+    }
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type != T_ZSET) {
+        out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        return;
+    }
+    
+    int64_t rank = zset_rank(ent->zset, cmd[2].data(), cmd[2].size());
+    if (rank >= 0) {
+        out_int(out, rank);
+    } else {
+        out_nil(out);
+    }
+}
+
+static void do_zquery(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+    if (cmd.size() != 6) {
+        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zquery' command");
+        return;
+    }
+    double score = 0;
+    int64_t offset = 0;
+    int64_t limit = 0;
+    try {
+        score = std::stod(cmd[2]);
+        offset = std::stoll(cmd[4]);
+        limit = std::stoll(cmd[5]);
+    } catch (...) {
+        out_err(out, ERR_BADARGS, "ERR value is not a valid float or integer");
+        return;
+    }
+    
+    Entry key;
+    key.node.hcode = str_hash(cmd[1]);
+    key.key = cmd[1];
+    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
+    if (!node) {
+        out_arr(out, 0);
+        return;
+    }
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type != T_ZSET) {
+        out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        return;
+    }
+    
+    std::vector<std::pair<std::string, double>> res;
+    zset_query(ent->zset, score, cmd[3].data(), cmd[3].size(), offset, limit, res);
+    
+    out_arr(out, (uint32_t)(res.size() * 2));
+    for (const auto &p : res) {
+        out_str(out, p.first);
+        out_dbl(out, p.second);
+    }
+}
+
+// --------------------------------------------------------------------------
 // Command dispatch — the central router.
 // --------------------------------------------------------------------------
 static void do_request(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
@@ -366,6 +634,16 @@ static void do_request(const std::vector<std::string> &cmd, std::vector<uint8_t>
         do_exists(cmd, out);
     } else if (cmd[0] == "keys" || cmd[0] == "KEYS") {
         do_keys(cmd, out);
+    } else if (cmd[0] == "zadd" || cmd[0] == "ZADD") {
+        do_zadd(cmd, out);
+    } else if (cmd[0] == "zscore" || cmd[0] == "ZSCORE") {
+        do_zscore(cmd, out);
+    } else if (cmd[0] == "zrem" || cmd[0] == "ZREM") {
+        do_zrem(cmd, out);
+    } else if (cmd[0] == "zrank" || cmd[0] == "ZRANK") {
+        do_zrank(cmd, out);
+    } else if (cmd[0] == "zquery" || cmd[0] == "ZQUERY") {
+        do_zquery(cmd, out);
     } else {
         out_err(out, ERR_UNKNOWN, "ERR unknown command");
     }
@@ -479,6 +757,9 @@ static void state_read(Conn *conn) {
 
     conn->rbuf_size += (size_t)rv;
 
+    // Moving connection to the tail of the idle list whenever it does IO
+    conn_touch(conn);
+
     while (try_one_request(conn)) {
         if (conn->state == STATE_WRITE) {
             return;
@@ -507,6 +788,9 @@ static void state_write(Conn *conn) {
     }
 
     conn->wbuf_sent += (size_t)rv;
+
+    // Moving connection to the tail of the idle list whenever it does IO
+    conn_touch(conn);
 
     if (conn->wbuf_sent == conn->wbuf_size) {
         conn->state = STATE_READ;
@@ -547,6 +831,8 @@ static void conn_accept(SOCKET listen_fd, std::vector<Conn *> &connections) {
         conn->fd = conn_fd;
         conn->state = STATE_READ;
         conn->want_close = false;
+        dlist_init(&conn->idle_list);
+        conn_touch(conn);
 
         connections.push_back(conn);
         printf("Client connected (fd=%u, total=%u).\n",
@@ -595,6 +881,7 @@ int main() {
 
     printf("Server listening on 127.0.0.1:1234 (event loop mode) ...\n");
 
+    dlist_init(&g_idle_list);
     std::vector<Conn *> connections;
 
     // ======================================================================
@@ -623,8 +910,9 @@ int main() {
             pfds.push_back(pfd);
         }
 
-        // ---- Step 2: WSAPoll — wait for events ----
-        int rv = WSAPoll(pfds.data(), (ULONG)pfds.size(), 1000);
+        // ---- Step 2: Compute dynamic timeout and WSAPoll ----
+        int timeout_ms = next_timer_ms();
+        int rv = WSAPoll(pfds.data(), (ULONG)pfds.size(), timeout_ms);
         if (rv == SOCKET_ERROR) {
             die("WSAPoll()");
         }
@@ -655,12 +943,16 @@ int main() {
             }
         }
 
-        // ---- Step 5: Sweep closed connections ----
+        // ---- Step 5: Process timers (timeout sweep) ----
+        process_timers();
+
+        // ---- Step 6: Sweep closed connections ----
         for (int i = (int)connections.size() - 1; i >= 0; i--) {
             if (connections[i]->want_close) {
                 Conn *conn = connections[i];
                 printf("Closing connection fd=%u.\n",
                        (unsigned)conn->fd);
+                dlist_detach(&conn->idle_list);
                 closesocket(conn->fd);
 
                 connections[i] = connections.back();

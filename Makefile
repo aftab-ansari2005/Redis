@@ -4,7 +4,7 @@ LDFLAGS = -lws2_32
 SRCDIR = src
 TESTDIR = tests
 
-all: server.exe client.exe test_oversized.exe test_concurrent.exe test_commands.exe test_hashtable.exe test_avl.exe
+all: server.exe client.exe test_oversized.exe test_concurrent.exe test_commands.exe test_hashtable.exe test_avl.exe test_zset.exe test_dlist.exe test_timers.exe
 
 hashtable.o: $(SRCDIR)/hashtable.cpp $(SRCDIR)/hashtable.h
 	$(CXX) $(CXXFLAGS) -c -o $@ $(SRCDIR)/hashtable.cpp
@@ -12,8 +12,11 @@ hashtable.o: $(SRCDIR)/hashtable.cpp $(SRCDIR)/hashtable.h
 avl.o: $(SRCDIR)/avl.cpp $(SRCDIR)/avl.h
 	$(CXX) $(CXXFLAGS) -c -o $@ $(SRCDIR)/avl.cpp
 
-server.exe: $(SRCDIR)/server.cpp $(SRCDIR)/hashtable.h $(SRCDIR)/serialization.h $(SRCDIR)/avl.h hashtable.o avl.o
-	$(CXX) $(CXXFLAGS) -o $@ $(SRCDIR)/server.cpp hashtable.o avl.o $(LDFLAGS)
+zset.o: $(SRCDIR)/zset.cpp $(SRCDIR)/zset.h $(SRCDIR)/hashtable.h $(SRCDIR)/avl.h
+	$(CXX) $(CXXFLAGS) -c -o $@ $(SRCDIR)/zset.cpp
+
+server.exe: $(SRCDIR)/server.cpp $(SRCDIR)/hashtable.h $(SRCDIR)/serialization.h $(SRCDIR)/avl.h $(SRCDIR)/zset.h $(SRCDIR)/dlist.h hashtable.o avl.o zset.o
+	$(CXX) $(CXXFLAGS) -o $@ $(SRCDIR)/server.cpp hashtable.o avl.o zset.o $(LDFLAGS)
 
 client.exe: $(SRCDIR)/client.cpp $(SRCDIR)/serialization.h
 	$(CXX) $(CXXFLAGS) -o $@ $(SRCDIR)/client.cpp $(LDFLAGS)
@@ -32,6 +35,15 @@ test_hashtable.exe: $(TESTDIR)/test_hashtable.cpp $(SRCDIR)/hashtable.h hashtabl
 
 test_avl.exe: $(TESTDIR)/test_avl.cpp $(SRCDIR)/avl.h avl.o
 	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_avl.cpp avl.o
+
+test_zset.exe: $(TESTDIR)/test_zset.cpp $(SRCDIR)/zset.h zset.o hashtable.o avl.o
+	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_zset.cpp zset.o hashtable.o avl.o
+
+test_dlist.exe: $(TESTDIR)/test_dlist.cpp $(SRCDIR)/dlist.h $(SRCDIR)/hashtable.h
+	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_dlist.cpp
+
+test_timers.exe: $(TESTDIR)/test_timers.cpp $(SRCDIR)/serialization.h
+	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_timers.cpp $(LDFLAGS)
 
 clean:
 	-del /Q *.exe *.o 2>NUL
