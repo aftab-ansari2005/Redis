@@ -45,6 +45,7 @@
 #include "serialization.h"
 #include "zset.h"
 #include "dlist.h"
+#include "heap.h"
 
 // --------------------------------------------------------------------------
 // WSAPoll compatibility shim for MinGW.
@@ -108,12 +109,14 @@ struct Entry {
     uint32_t type = 0;
     std::string val;       // for T_STR
     ZSet *zset = NULL;     // for T_ZSET
+    size_t heap_idx = (size_t)-1; // index in g_heap, or (size_t)-1 if no TTL
 };
 
 static void entry_destroy(Entry *ent) {
     if (ent->type == T_ZSET) {
         zset_destroy(ent->zset);
         delete ent->zset;
+        ent->zset = NULL;
     }
 }
 
@@ -134,8 +137,49 @@ static bool entry_eq(HNode *lhs, HNode *rhs) {
     return le->key == re->key;
 }
 
-// The global key-value store.
+// The global key-value store and TTL min-heap.
 static HMap g_map = {};
+static std::vector<HeapItem> g_heap;
+
+// Monotonic clock reading in microseconds
+static uint64_t get_monotonic_usec() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+}
+
+// Detach an entry from hashtable and heap, then free it completely.
+static void detach_and_free_entry(Entry *ent) {
+    hm_delete(&g_map, &ent->node, &entry_eq);
+    if (ent->heap_idx != (size_t)-1) {
+        heap_delete(g_heap, ent->heap_idx);
+    }
+    entry_destroy(ent);
+    delete ent;
+}
+
+// Look up a key in g_map and perform lazy expiration if it has expired.
+// Returns Entry* if key exists and is alive; returns NULL if key doesn't exist or was expired.
+static Entry *get_live_entry(const std::string &key_str) {
+    Entry key;
+    key.node.hcode = str_hash(key_str);
+    key.key = key_str;
+
+    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
+    if (!node) {
+        return NULL;
+    }
+
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->heap_idx != (size_t)-1) {
+        uint64_t now_us = get_monotonic_usec();
+        if (g_heap[ent->heap_idx].val <= now_us) {
+            detach_and_free_entry(ent);
+            return NULL;
+        }
+    }
+    return ent;
+}
 
 // --------------------------------------------------------------------------
 // Connection state enum.
@@ -176,13 +220,6 @@ static const uint64_t k_idle_timeout_us = 5ULL * 1000 * 1000; // 5 seconds
 // with the oldest (soonest-to-expire) connection always at g_idle_list.next.
 static DList g_idle_list = {};
 
-// Monotonic clock reading in microseconds
-static uint64_t get_monotonic_usec() {
-    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()
-    ).count();
-}
-
 // Update last active timestamp and move connection to the tail of g_idle_list
 static void conn_touch(Conn *conn) {
     conn->idle_start = get_monotonic_usec();
@@ -190,19 +227,31 @@ static void conn_touch(Conn *conn) {
     dlist_insert_before(&g_idle_list, &conn->idle_list);
 }
 
-// Compute dynamic poll timeout: milliseconds until the earliest timeout fires
+// Compute dynamic poll timeout: milliseconds until the earliest timeout fires.
+// Considers BOTH idle connections (g_idle_list) and key TTL expirations (g_heap).
 static int next_timer_ms() {
     uint64_t now_us = get_monotonic_usec();
     uint64_t next_us = (uint64_t)-1;
 
-    // The connection needing to time out soonest is always at head (g_idle_list.next)
+    // Timer source 1: Idle connection timeout (head of intrusive list)
     if (!dlist_empty(&g_idle_list)) {
         Conn *conn = container_of(g_idle_list.next, Conn, idle_list);
-        next_us = conn->idle_start + k_idle_timeout_us;
+        uint64_t conn_deadline = conn->idle_start + k_idle_timeout_us;
+        if (conn_deadline < next_us) {
+            next_us = conn_deadline;
+        }
+    }
+
+    // Timer source 2: Key TTL expiration (root of binary min-heap)
+    if (!g_heap.empty()) {
+        uint64_t key_deadline = g_heap[0].val;
+        if (key_deadline < next_us) {
+            next_us = key_deadline;
+        }
     }
 
     if (next_us == (uint64_t)-1) {
-        return 10000; // default wait when no connections exist
+        return 10000; // default wait when no timers are active
     }
 
     if (next_us <= now_us) {
@@ -213,9 +262,11 @@ static int next_timer_ms() {
     return (int)((next_us - now_us + 999) / 1000);
 }
 
-// Timeout sweep: close any connections whose idle duration >= k_idle_timeout_us
+// Timeout sweep: close idle connections and actively reclaim expired keys
 static void process_timers() {
     uint64_t now_us = get_monotonic_usec();
+
+    // 1. Idle connection sweep
     while (!dlist_empty(&g_idle_list)) {
         Conn *conn = container_of(g_idle_list.next, Conn, idle_list);
         uint64_t next_us = conn->idle_start + k_idle_timeout_us;
@@ -229,6 +280,12 @@ static void process_timers() {
                (unsigned)((now_us - conn->idle_start) / 1000));
         conn->want_close = true;
         dlist_detach(&conn->idle_list);
+    }
+
+    // 2. Active TTL key expiration sweep (min-heap root eviction)
+    while (!g_heap.empty() && g_heap[0].val <= now_us) {
+        Entry *ent = container_of(g_heap[0].ref, Entry, heap_idx);
+        detach_and_free_entry(ent);
     }
 }
 
@@ -301,17 +358,11 @@ static void do_get(const std::vector<std::string> &cmd, std::vector<uint8_t> &ou
         return;
     }
 
-    Entry key;
-    key.node.hcode = str_hash(cmd[1]);
-    key.key = cmd[1];
-
-    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
-    if (!node) {
-        // Key not found — return NIL, not an error.
-        // This is semantically correct: "no value" is different from "something went wrong".
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
+        // Key not found or expired — return NIL
         out_nil(out);
     } else {
-        Entry *ent = container_of(node, Entry, node);
         if (ent->type != T_STR) {
             out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
             return;
@@ -326,30 +377,29 @@ static void do_set(const std::vector<std::string> &cmd, std::vector<uint8_t> &ou
         return;
     }
 
-    Entry key;
-    key.node.hcode = str_hash(cmd[1]);
-    key.key = cmd[1];
-
-    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
-    if (node) {
-        // Key exists — update value in place
-        Entry *ent = container_of(node, Entry, node);
+    Entry *ent = get_live_entry(cmd[1]);
+    if (ent) {
+        // Key exists and is alive — update value in place.
+        // In Redis, SET clears any existing TTL unless KEEPTTL is specified.
+        if (ent->heap_idx != (size_t)-1) {
+            heap_delete(g_heap, ent->heap_idx);
+        }
         if (ent->type != T_STR) {
-            out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
-            return;
+            entry_destroy(ent);
+            ent->type = T_STR;
         }
         ent->val = cmd[2];
     } else {
-        // Key doesn't exist — allocate a new Entry and insert
-        Entry *ent = new Entry();
+        // Key doesn't exist (or was expired and lazily reaped)
+        ent = new Entry();
         ent->key = cmd[1];
         ent->type = T_STR;
         ent->val = cmd[2];
-        ent->node.hcode = key.node.hcode;
+        ent->node.hcode = str_hash(cmd[1]);
+        ent->heap_idx = (size_t)-1;
         hm_insert(&g_map, &ent->node);
     }
 
-    // SET returns a simple string "OK", matching real Redis behavior.
     out_str(out, "OK");
 }
 
@@ -359,20 +409,12 @@ static void do_del(const std::vector<std::string> &cmd, std::vector<uint8_t> &ou
         return;
     }
 
-    Entry key;
-    key.node.hcode = str_hash(cmd[1]);
-    key.key = cmd[1];
-
-    HNode *node = hm_delete(&g_map, &key.node, &entry_eq);
-    if (!node) {
-        // Key didn't exist — deleted 0 keys.
-        // NOW returns an integer 0 instead of the string "0".
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
+        // Key didn't exist or was already expired
         out_int(out, 0);
     } else {
-        Entry *ent = container_of(node, Entry, node);
-        entry_destroy(ent);
-        delete ent;
-        // Deleted 1 key — return integer 1.
+        detach_and_free_entry(ent);
         out_int(out, 1);
     }
 }
@@ -383,61 +425,36 @@ static void do_exists(const std::vector<std::string> &cmd, std::vector<uint8_t> 
         return;
     }
 
-    Entry key;
-    key.node.hcode = str_hash(cmd[1]);
-    key.key = cmd[1];
-
-    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
-    // EXISTS returns integer 1 (found) or 0 (not found).
-    // In real Redis, EXISTS can take multiple keys and returns the count of
-    // keys that exist. We only support single-key for now.
-    out_int(out, node ? 1 : 0);
+    Entry *ent = get_live_entry(cmd[1]);
+    out_int(out, ent ? 1 : 0);
 }
 
 // --------------------------------------------------------------------------
-// KEYS command — new! Returns all keys as an array of strings.
-//
-// This is a good demo of the SER_ARR type: the response is an array where
-// each element is a SER_STR. In real Redis, KEYS takes a glob pattern;
-// we return all keys unconditionally for simplicity.
-//
-// WARNING: Like real Redis's KEYS command, this is O(N) in the number of
-// keys and should never be used in production on a large database. We
-// include it here because it's the simplest way to exercise array responses.
+// KEYS command — Returns all live keys as an array of strings.
 // --------------------------------------------------------------------------
-static void cb_scan(HNode *node, void *arg) {
-    std::vector<std::string> *keys = (std::vector<std::string> *)arg;
-    Entry *ent = container_of(node, Entry, node);
-    keys->push_back(ent->key);
-}
-
 static void do_keys(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
-    (void)cmd;  // KEYS takes no arguments (simplified — no glob pattern)
-
-    // Collect all keys by scanning both hash tables.
+    (void)cmd;  // KEYS takes no arguments
+    uint64_t now_us = get_monotonic_usec();
     std::vector<std::string> keys;
-    // Scan ht1
-    if (g_map.ht1.tab) {
-        for (size_t i = 0; i <= g_map.ht1.mask; i++) {
-            HNode *node = g_map.ht1.tab[i];
-            while (node) {
-                cb_scan(node, &keys);
-                node = node->next;
-            }
-        }
-    }
-    // Scan ht2 (active during rehashing)
-    if (g_map.ht2.tab) {
-        for (size_t i = 0; i <= g_map.ht2.mask; i++) {
-            HNode *node = g_map.ht2.tab[i];
-            while (node) {
-                cb_scan(node, &keys);
-                node = node->next;
-            }
-        }
-    }
 
-    // Serialize as an array of strings
+    auto collect_keys = [&](HTab *tab) {
+        if (!tab || !tab->tab) return;
+        for (size_t i = 0; i <= tab->mask; i++) {
+            HNode *node = tab->tab[i];
+            while (node) {
+                Entry *ent = container_of(node, Entry, node);
+                node = node->next;
+                if (ent->heap_idx != (size_t)-1 && g_heap[ent->heap_idx].val <= now_us) {
+                    continue; // Skip expired key
+                }
+                keys.push_back(ent->key);
+            }
+        }
+    };
+
+    collect_keys(&g_map.ht1);
+    collect_keys(&g_map.ht2);
+
     out_arr(out, (uint32_t)keys.size());
     for (const std::string &k : keys) {
         out_str(out, k);
@@ -461,22 +478,17 @@ static void do_zadd(const std::vector<std::string> &cmd, std::vector<uint8_t> &o
         return;
     }
     
-    Entry key;
-    key.node.hcode = str_hash(cmd[1]);
-    key.key = cmd[1];
-
-    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
-    Entry *ent = NULL;
-    if (!node) {
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
         ent = new Entry();
         ent->key = cmd[1];
-        ent->node.hcode = key.node.hcode;
+        ent->node.hcode = str_hash(cmd[1]);
         ent->type = T_ZSET;
+        ent->heap_idx = (size_t)-1;
         ent->zset = new ZSet();
         zset_init(ent->zset);
         hm_insert(&g_map, &ent->node);
     } else {
-        ent = container_of(node, Entry, node);
         if (ent->type != T_ZSET) {
             out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
             return;
@@ -493,16 +505,11 @@ static void do_zscore(const std::vector<std::string> &cmd, std::vector<uint8_t> 
         return;
     }
     
-    Entry key;
-    key.node.hcode = str_hash(cmd[1]);
-    key.key = cmd[1];
-
-    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
-    if (!node) {
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
         out_nil(out);
         return;
     }
-    Entry *ent = container_of(node, Entry, node);
     if (ent->type != T_ZSET) {
         out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
         return;
@@ -521,15 +528,11 @@ static void do_zrem(const std::vector<std::string> &cmd, std::vector<uint8_t> &o
         out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zrem' command");
         return;
     }
-    Entry key;
-    key.node.hcode = str_hash(cmd[1]);
-    key.key = cmd[1];
-    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
-    if (!node) {
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
         out_int(out, 0);
         return;
     }
-    Entry *ent = container_of(node, Entry, node);
     if (ent->type != T_ZSET) {
         out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
         return;
@@ -549,15 +552,11 @@ static void do_zrank(const std::vector<std::string> &cmd, std::vector<uint8_t> &
         out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zrank' command");
         return;
     }
-    Entry key;
-    key.node.hcode = str_hash(cmd[1]);
-    key.key = cmd[1];
-    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
-    if (!node) {
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
         out_nil(out);
         return;
     }
-    Entry *ent = container_of(node, Entry, node);
     if (ent->type != T_ZSET) {
         out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
         return;
@@ -588,15 +587,11 @@ static void do_zquery(const std::vector<std::string> &cmd, std::vector<uint8_t> 
         return;
     }
     
-    Entry key;
-    key.node.hcode = str_hash(cmd[1]);
-    key.key = cmd[1];
-    HNode *node = hm_lookup(&g_map, &key.node, &entry_eq);
-    if (!node) {
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
         out_arr(out, 0);
         return;
     }
-    Entry *ent = container_of(node, Entry, node);
     if (ent->type != T_ZSET) {
         out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
         return;
@@ -613,6 +608,173 @@ static void do_zquery(const std::vector<std::string> &cmd, std::vector<uint8_t> 
 }
 
 // --------------------------------------------------------------------------
+// TTL commands (Chapter 13)
+// --------------------------------------------------------------------------
+
+static void do_expire(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+    if (cmd.size() != 3) {
+        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'expire' command");
+        return;
+    }
+
+    int64_t ttl_sec = 0;
+    try {
+        ttl_sec = std::stoll(cmd[2]);
+    } catch (...) {
+        out_err(out, ERR_BADARGS, "ERR value is not an integer or out of range");
+        return;
+    }
+
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
+        // Key doesn't exist or already expired
+        out_int(out, 0);
+        return;
+    }
+
+    if (ttl_sec <= 0) {
+        // Non-positive TTL expires and deletes the key immediately
+        detach_and_free_entry(ent);
+        out_int(out, 1);
+        return;
+    }
+
+    uint64_t now_us = get_monotonic_usec();
+    uint64_t expire_us = now_us + (uint64_t)ttl_sec * 1000000ULL;
+
+    if (ent->heap_idx != (size_t)-1) {
+        // Update existing heap position in O(log n)
+        heap_update_val(g_heap, ent->heap_idx, expire_us);
+    } else {
+        // Push new heap node in O(log n)
+        heap_insert(g_heap, expire_us, &ent->heap_idx);
+    }
+
+    out_int(out, 1);
+}
+
+static void do_pexpire(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+    if (cmd.size() != 3) {
+        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'pexpire' command");
+        return;
+    }
+
+    int64_t ttl_ms = 0;
+    try {
+        ttl_ms = std::stoll(cmd[2]);
+    } catch (...) {
+        out_err(out, ERR_BADARGS, "ERR value is not an integer or out of range");
+        return;
+    }
+
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
+        out_int(out, 0);
+        return;
+    }
+
+    if (ttl_ms <= 0) {
+        detach_and_free_entry(ent);
+        out_int(out, 1);
+        return;
+    }
+
+    uint64_t now_us = get_monotonic_usec();
+    uint64_t expire_us = now_us + (uint64_t)ttl_ms * 1000ULL;
+
+    if (ent->heap_idx != (size_t)-1) {
+        heap_update_val(g_heap, ent->heap_idx, expire_us);
+    } else {
+        heap_insert(g_heap, expire_us, &ent->heap_idx);
+    }
+
+    out_int(out, 1);
+}
+
+static void do_ttl(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+    if (cmd.size() != 2) {
+        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'ttl' command");
+        return;
+    }
+
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
+        // -2 if the key does not exist (or has expired)
+        out_int(out, -2);
+        return;
+    }
+
+    if (ent->heap_idx == (size_t)-1) {
+        // -1 if the key exists but has no associated expire
+        out_int(out, -1);
+        return;
+    }
+
+    uint64_t now_us = get_monotonic_usec();
+    uint64_t expire_us = g_heap[ent->heap_idx].val;
+    if (expire_us <= now_us) {
+        detach_and_free_entry(ent);
+        out_int(out, -2);
+        return;
+    }
+
+    // Ceil division so that remaining time > 0 returns at least 1 second
+    int64_t remain_sec = (int64_t)((expire_us - now_us + 999999ULL) / 1000000ULL);
+    out_int(out, remain_sec);
+}
+
+static void do_pttl(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+    if (cmd.size() != 2) {
+        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'pttl' command");
+        return;
+    }
+
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
+        out_int(out, -2);
+        return;
+    }
+
+    if (ent->heap_idx == (size_t)-1) {
+        out_int(out, -1);
+        return;
+    }
+
+    uint64_t now_us = get_monotonic_usec();
+    uint64_t expire_us = g_heap[ent->heap_idx].val;
+    if (expire_us <= now_us) {
+        detach_and_free_entry(ent);
+        out_int(out, -2);
+        return;
+    }
+
+    int64_t remain_ms = (int64_t)((expire_us - now_us + 999ULL) / 1000ULL);
+    out_int(out, remain_ms);
+}
+
+static void do_persist(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+    if (cmd.size() != 2) {
+        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'persist' command");
+        return;
+    }
+
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
+        out_int(out, 0); // Key does not exist
+        return;
+    }
+
+    if (ent->heap_idx == (size_t)-1) {
+        out_int(out, 0); // Key has no associated timeout
+        return;
+    }
+
+    // Remove from heap and reset heap_idx to (size_t)-1
+    heap_delete(g_heap, ent->heap_idx);
+    out_int(out, 1); // Timeout removed
+}
+
+// --------------------------------------------------------------------------
 // Command dispatch — the central router.
 // --------------------------------------------------------------------------
 static void do_request(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
@@ -622,8 +784,6 @@ static void do_request(const std::vector<std::string> &cmd, std::vector<uint8_t>
     }
 
     // Case-insensitive command matching.
-    // We compare against both cases manually — simple and avoids pulling in
-    // <algorithm> for std::transform. A real server would normalize once.
     if (cmd[0] == "get" || cmd[0] == "GET") {
         do_get(cmd, out);
     } else if (cmd[0] == "set" || cmd[0] == "SET") {
@@ -634,6 +794,16 @@ static void do_request(const std::vector<std::string> &cmd, std::vector<uint8_t>
         do_exists(cmd, out);
     } else if (cmd[0] == "keys" || cmd[0] == "KEYS") {
         do_keys(cmd, out);
+    } else if (cmd[0] == "expire" || cmd[0] == "EXPIRE") {
+        do_expire(cmd, out);
+    } else if (cmd[0] == "pexpire" || cmd[0] == "PEXPIRE") {
+        do_pexpire(cmd, out);
+    } else if (cmd[0] == "ttl" || cmd[0] == "TTL") {
+        do_ttl(cmd, out);
+    } else if (cmd[0] == "pttl" || cmd[0] == "PTTL") {
+        do_pttl(cmd, out);
+    } else if (cmd[0] == "persist" || cmd[0] == "PERSIST") {
+        do_persist(cmd, out);
     } else if (cmd[0] == "zadd" || cmd[0] == "ZADD") {
         do_zadd(cmd, out);
     } else if (cmd[0] == "zscore" || cmd[0] == "ZSCORE") {
