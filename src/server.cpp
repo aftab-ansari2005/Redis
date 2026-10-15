@@ -46,6 +46,7 @@
 #include "zset.h"
 #include "dlist.h"
 #include "heap.h"
+#include "thread_pool.h"
 
 // --------------------------------------------------------------------------
 // WSAPoll compatibility shim for MinGW.
@@ -112,12 +113,32 @@ struct Entry {
     size_t heap_idx = (size_t)-1; // index in g_heap, or (size_t)-1 if no TTL
 };
 
+// --------------------------------------------------------------------------
+// Thread Pool for slow / blocking operations (Chapter 14)
+// --------------------------------------------------------------------------
+static ThreadPool g_tp;
+static const size_t k_large_container_size = 1000;
+static bool g_lazyfree_enabled = true;
+
 static void entry_destroy(Entry *ent) {
     if (ent->type == T_ZSET) {
         zset_destroy(ent->zset);
         delete ent->zset;
         ent->zset = NULL;
     }
+}
+
+// Background worker tasks for async deallocations
+static void entry_del_async(void *arg) {
+    Entry *ent = (Entry *)arg;
+    entry_destroy(ent);
+    delete ent;
+}
+
+static void zset_del_async(void *arg) {
+    ZSet *zset = (ZSet *)arg;
+    zset_destroy(zset);
+    delete zset;
 }
 
 // FNV-1a hash
@@ -149,13 +170,34 @@ static uint64_t get_monotonic_usec() {
 }
 
 // Detach an entry from hashtable and heap, then free it completely.
+// If the collection is large and lazyfree is enabled, the expensive destruction
+// is offloaded to the thread pool so the event loop is not blocked.
+//
+// CORRECTNESS CARE:
+// 1. We MUST completely detach the entry from g_map (hm_delete) and g_heap
+//    (heap_delete) BEFORE handing the pointer to the thread pool.
+// 2. Once detached, no event loop operation can observe or modify 'ent'.
+// 3. The worker thread has exclusive ownership of 'ent' and frees it safely.
 static void detach_and_free_entry(Entry *ent) {
     hm_delete(&g_map, &ent->node, &entry_eq);
     if (ent->heap_idx != (size_t)-1) {
         heap_delete(g_heap, ent->heap_idx);
+        ent->heap_idx = (size_t)-1;
     }
-    entry_destroy(ent);
-    delete ent;
+
+    bool too_big = false;
+    if (g_lazyfree_enabled) {
+        if (ent->type == T_ZSET && ent->zset) {
+            too_big = hm_size(&ent->zset->hmap) > k_large_container_size;
+        }
+    }
+
+    if (too_big) {
+        thread_pool_queue(&g_tp, &entry_del_async, ent);
+    } else {
+        entry_destroy(ent);
+        delete ent;
+    }
 }
 
 // Look up a key in g_map and perform lazy expiration if it has expired.
@@ -383,10 +425,18 @@ static void do_set(const std::vector<std::string> &cmd, std::vector<uint8_t> &ou
         // In Redis, SET clears any existing TTL unless KEEPTTL is specified.
         if (ent->heap_idx != (size_t)-1) {
             heap_delete(g_heap, ent->heap_idx);
+            ent->heap_idx = (size_t)-1;
         }
-        if (ent->type != T_STR) {
-            entry_destroy(ent);
+        if (ent->type == T_ZSET) {
+            ZSet *zset = ent->zset;
+            ent->zset = NULL;
             ent->type = T_STR;
+            if (g_lazyfree_enabled && hm_size(&zset->hmap) > k_large_container_size) {
+                thread_pool_queue(&g_tp, &zset_del_async, zset);
+            } else {
+                zset_destroy(zset);
+                delete zset;
+            }
         }
         ent->val = cmd[2];
     } else {
@@ -775,6 +825,91 @@ static void do_persist(const std::vector<std::string> &cmd, std::vector<uint8_t>
 }
 
 // --------------------------------------------------------------------------
+// Utility and Benchmark helper commands (PING, CONFIG, ZPOPULATE)
+// --------------------------------------------------------------------------
+
+static void do_ping(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+    if (cmd.size() == 1) {
+        out_str(out, "PONG");
+    } else if (cmd.size() == 2) {
+        out_str(out, cmd[1]);
+    } else {
+        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'ping' command");
+    }
+}
+
+static void do_config(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+    if (cmd.size() >= 3 && (cmd[1] == "set" || cmd[1] == "SET")) {
+        if (cmd[2] == "lazyfree" || cmd[2] == "LAZYFREE") {
+            if (cmd.size() < 4) {
+                out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'config set'");
+                return;
+            }
+            if (cmd[3] == "1" || cmd[3] == "yes" || cmd[3] == "true") {
+                g_lazyfree_enabled = true;
+                out_str(out, "OK");
+            } else if (cmd[3] == "0" || cmd[3] == "no" || cmd[3] == "false") {
+                g_lazyfree_enabled = false;
+                out_str(out, "OK");
+            } else {
+                out_err(out, ERR_BADARGS, "ERR value must be 0 or 1");
+            }
+            return;
+        }
+    } else if (cmd.size() >= 3 && (cmd[1] == "get" || cmd[1] == "GET")) {
+        if (cmd[2] == "lazyfree" || cmd[2] == "LAZYFREE") {
+            out_arr(out, 2);
+            out_str(out, "lazyfree");
+            out_str(out, g_lazyfree_enabled ? "yes" : "no");
+            return;
+        }
+    }
+    out_err(out, ERR_UNKNOWN, "ERR unsupported config command");
+}
+
+static void do_zpopulate(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+    if (cmd.size() != 3) {
+        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zpopulate' command");
+        return;
+    }
+    int64_t count = 0;
+    try {
+        count = std::stoll(cmd[2]);
+    } catch (...) {
+        out_err(out, ERR_BADARGS, "ERR invalid count");
+        return;
+    }
+    if (count <= 0) {
+        out_int(out, 0);
+        return;
+    }
+
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
+        ent = new Entry();
+        ent->key = cmd[1];
+        ent->node.hcode = str_hash(cmd[1]);
+        ent->type = T_ZSET;
+        ent->heap_idx = (size_t)-1;
+        ent->zset = new ZSet();
+        zset_init(ent->zset);
+        hm_insert(&g_map, &ent->node);
+    } else if (ent->type != T_ZSET) {
+        out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        return;
+    }
+
+    int64_t added = 0;
+    for (int64_t i = 0; i < count; i++) {
+        std::string name = "m" + std::to_string(i);
+        if (zset_add(ent->zset, name.data(), name.size(), (double)i)) {
+            added++;
+        }
+    }
+    out_int(out, added);
+}
+
+// --------------------------------------------------------------------------
 // Command dispatch — the central router.
 // --------------------------------------------------------------------------
 static void do_request(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
@@ -788,8 +923,14 @@ static void do_request(const std::vector<std::string> &cmd, std::vector<uint8_t>
         do_get(cmd, out);
     } else if (cmd[0] == "set" || cmd[0] == "SET") {
         do_set(cmd, out);
-    } else if (cmd[0] == "del" || cmd[0] == "DEL") {
+    } else if (cmd[0] == "del" || cmd[0] == "DEL" || cmd[0] == "unlink" || cmd[0] == "UNLINK") {
         do_del(cmd, out);
+    } else if (cmd[0] == "ping" || cmd[0] == "PING") {
+        do_ping(cmd, out);
+    } else if (cmd[0] == "config" || cmd[0] == "CONFIG") {
+        do_config(cmd, out);
+    } else if (cmd[0] == "zpopulate" || cmd[0] == "ZPOPULATE") {
+        do_zpopulate(cmd, out);
     } else if (cmd[0] == "exists" || cmd[0] == "EXISTS") {
         do_exists(cmd, out);
     } else if (cmd[0] == "keys" || cmd[0] == "KEYS") {
@@ -1049,7 +1190,10 @@ int main() {
 
     set_nonblocking(listen_fd);
 
-    printf("Server listening on 127.0.0.1:1234 (event loop mode) ...\n");
+    // Initialize background thread pool with 4 workers for async deallocations
+    thread_pool_init(&g_tp, 4);
+
+    printf("Server listening on 127.0.0.1:1234 (event loop + thread pool mode) ...\n");
 
     dlist_init(&g_idle_list);
     std::vector<Conn *> connections;

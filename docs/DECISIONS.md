@@ -23,3 +23,23 @@ Format: Part N — what happened, what you chose, and why.
 - **Choice:** Implemented `get_live_entry(key_str)` as the single point of entry for all command handlers (`GET`, `SET`, `DEL`, `EXISTS`, `KEYS`, `TTL`, `EXPIRE`, `PERSIST`, ZSet commands). If the key has `heap_idx != (size_t)-1` and `now_us >= expire_us`, it lazily purges the entry from both `g_map` and `g_heap` before returning `nullptr`.
 - **Result:** Guarantees 100% semantic correctness — no client ever observes an expired key, regardless of active sweep timing.
 
+---
+
+## Part 11 (Chapter 14) — Thread Pool for Blocking Deallocations (Lazy Freeing)
+
+### 1. Detachment-Before-Handover Invariant (Zero Locking on Main Keyspace)
+- **Context:** In a single-threaded event loop, calling `DEL` on a collection with hundreds of thousands or millions of elements (like an AVL-based `ZSet`) blocks the event loop for hundreds of milliseconds while executing millions of `delete` invocations. To offload this to worker threads without complicating the single-threaded design with fine-grained keyspace mutexes, we must guarantee thread safety.
+- **Choice:** Before handing an `Entry*` or `ZSet*` to `thread_pool_queue()`, the main thread *completely unlinks* it from the global hash table `g_map` (`hm_delete`) and from the TTL min-heap `g_heap` (`heap_delete`).
+- **Result:** The detached data structure is completely isolated and invisible to subsequent event-loop queries (`GET`, `SET`, `DEL`, etc.). The worker thread takes exclusive ownership of the memory and destroys it concurrently without needing any locks on the main database.
+
+### 2. Deallocation Cost Threshold (`k_large_container_size`)
+- **Context:** Submitting tasks to a thread pool incurs synchronization overhead (mutex lock + condvar signal). For small values or collections with few members, synchronous freeing is significantly faster than thread pool queue contention.
+- **Choice:** Added a threshold check (`k_large_container_size = 1000`). If a ZSet has $> 1000$ members, it is offloaded to the thread pool; otherwise, it is destroyed immediately on the event-loop thread.
+- **Result:** Preserves high throughput for normal small-key workloads while preventing catastrophic tail latency spikes on mega-key destructions.
+
+### 3. Cross-Platform Threading Primitives (Win32 & POSIX)
+- **Context:** MinGW on Windows with standard `win32` thread model does not support C++11 `<thread>`/`<mutex>`.
+- **Choice:** Implemented `ThreadPool` with conditional compilation supporting native Windows synchronization (`CRITICAL_SECTION`, `CONDITION_VARIABLE`, `_beginthreadex`) as well as standard POSIX (`pthread_mutex_t`, `pthread_cond_t`, `pthread_create`).
+- **Result:** Fully portable across Windows (MinGW/MSVC) and Linux/macOS with zero external runtime dependencies.
+
+
