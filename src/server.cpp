@@ -42,7 +42,7 @@
 #include <vector>
 #include <string>
 #include "hashtable.h"
-#include "serialization.h"
+#include "resp.h"
 #include "zset.h"
 #include "dlist.h"
 #include "heap.h"
@@ -235,22 +235,20 @@ enum {
 // Conn — per-connection state.
 // --------------------------------------------------------------------------
 struct Conn {
-    SOCKET   fd;
-    int      state;         // STATE_READ or STATE_WRITE
-    bool     want_close;    // marked for cleanup at end of event loop iteration
+    SOCKET   fd = INVALID_SOCKET;
+    int      state = STATE_READ;    // STATE_READ or STATE_WRITE
+    bool     want_close = false;   // marked for cleanup at end of event loop iteration
 
-    // Read buffer
-    uint8_t  rbuf[4 + k_max_msg];
-    size_t   rbuf_size;     // valid bytes currently in rbuf
+    // Read buffer (dynamic to support pipelining and large messages)
+    std::string rbuf;
 
     // Write buffer
-    uint8_t  wbuf[4 + k_max_msg];
-    size_t   wbuf_size;     // total bytes in wbuf that need to be sent
-    size_t   wbuf_sent;     // bytes already sent
+    std::string wbuf;
+    size_t   wbuf_sent = 0;        // bytes already sent
 
     // Idle timer tracking
-    uint64_t idle_start;    // timestamp in microseconds of last IO activity
-    DList    idle_list;     // intrusive doubly-linked list node in g_idle_list
+    uint64_t idle_start = 0;       // timestamp in microseconds of last IO activity
+    DList    idle_list = {};       // intrusive doubly-linked list node in g_idle_list
 };
 
 // --------------------------------------------------------------------------
@@ -352,77 +350,35 @@ static void state_read(Conn *conn);
 static void state_write(Conn *conn);
 
 // --------------------------------------------------------------------------
-// Request parsing (unchanged from Part 5)
-// --------------------------------------------------------------------------
-static bool parse_req(const uint8_t *data, size_t len, std::vector<std::string> &out) {
-    if (len < 4) return false;
-    uint32_t nstr = 0;
-    memcpy(&nstr, &data[0], 4);
-
-    // Sane limit on arg count
-    if (nstr > 1000) return false;
-
-    size_t pos = 4;
-    while (nstr--) {
-        if (pos + 4 > len) return false;
-        uint32_t sz = 0;
-        memcpy(&sz, &data[pos], 4);
-        if (pos + 4 + sz > len) return false;
-
-        out.push_back(std::string((char*)&data[pos + 4], sz));
-        pos += 4 + sz;
-    }
-
-    if (pos != len) return false;  // trailing garbage
-    return true;
-}
-
-// --------------------------------------------------------------------------
-// Command handlers — now serialize typed responses directly.
-//
-// BEFORE (Part 5):
-//   void do_get(..., uint32_t &status, std::vector<uint8_t> &res);
-//   Status was a flat enum, res was raw bytes.
-//
-// AFTER (Part 6):
-//   void do_get(..., std::vector<uint8_t> &out);
-//   The output IS the serialized typed value. No separate status field.
-//   The type tag itself carries the "status" information:
-//     - SER_NIL  = key not found (was RES_NX)
-//     - SER_ERR  = error (was RES_ERR)
-//     - SER_STR  = success with string (was RES_OK + bytes)
-//     - SER_INT  = success with integer (new! DEL/EXISTS return int now)
+// Command handlers — serialize RESP2 responses directly to std::string.
 // --------------------------------------------------------------------------
 
-static void do_get(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_get(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 2) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'get' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'get' command");
         return;
     }
 
     Entry *ent = get_live_entry(cmd[1]);
     if (!ent) {
-        // Key not found or expired — return NIL
-        out_nil(out);
+        resp_out_null_bulk(out);
     } else {
         if (ent->type != T_STR) {
-            out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+            resp_out_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
             return;
         }
-        out_str(out, ent->val);
+        resp_out_bulk(out, ent->val);
     }
 }
 
-static void do_set(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_set(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 3) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'set' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'set' command");
         return;
     }
 
     Entry *ent = get_live_entry(cmd[1]);
     if (ent) {
-        // Key exists and is alive — update value in place.
-        // In Redis, SET clears any existing TTL unless KEEPTTL is specified.
         if (ent->heap_idx != (size_t)-1) {
             heap_delete(g_heap, ent->heap_idx);
             ent->heap_idx = (size_t)-1;
@@ -440,7 +396,6 @@ static void do_set(const std::vector<std::string> &cmd, std::vector<uint8_t> &ou
         }
         ent->val = cmd[2];
     } else {
-        // Key doesn't exist (or was expired and lazily reaped)
         ent = new Entry();
         ent->key = cmd[1];
         ent->type = T_STR;
@@ -450,40 +405,42 @@ static void do_set(const std::vector<std::string> &cmd, std::vector<uint8_t> &ou
         hm_insert(&g_map, &ent->node);
     }
 
-    out_str(out, "OK");
+    resp_out_str(out, "OK");
 }
 
-static void do_del(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
-    if (cmd.size() != 2) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'del' command");
+static void do_del(const std::vector<std::string> &cmd, std::string &out) {
+    if (cmd.size() < 2) {
+        resp_out_err(out, "ERR wrong number of arguments for 'del' command");
         return;
     }
 
-    Entry *ent = get_live_entry(cmd[1]);
-    if (!ent) {
-        // Key didn't exist or was already expired
-        out_int(out, 0);
-    } else {
-        detach_and_free_entry(ent);
-        out_int(out, 1);
+    int64_t count = 0;
+    for (size_t i = 1; i < cmd.size(); i++) {
+        Entry *ent = get_live_entry(cmd[i]);
+        if (ent) {
+            detach_and_free_entry(ent);
+            count++;
+        }
     }
+    resp_out_int(out, count);
 }
 
-static void do_exists(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
-    if (cmd.size() != 2) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'exists' command");
+static void do_exists(const std::vector<std::string> &cmd, std::string &out) {
+    if (cmd.size() < 2) {
+        resp_out_err(out, "ERR wrong number of arguments for 'exists' command");
         return;
     }
 
-    Entry *ent = get_live_entry(cmd[1]);
-    out_int(out, ent ? 1 : 0);
+    int64_t count = 0;
+    for (size_t i = 1; i < cmd.size(); i++) {
+        Entry *ent = get_live_entry(cmd[i]);
+        if (ent) count++;
+    }
+    resp_out_int(out, count);
 }
 
-// --------------------------------------------------------------------------
-// KEYS command — Returns all live keys as an array of strings.
-// --------------------------------------------------------------------------
-static void do_keys(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
-    (void)cmd;  // KEYS takes no arguments
+static void do_keys(const std::vector<std::string> &cmd, std::string &out) {
+    (void)cmd;
     uint64_t now_us = get_monotonic_usec();
     std::vector<std::string> keys;
 
@@ -505,26 +462,22 @@ static void do_keys(const std::vector<std::string> &cmd, std::vector<uint8_t> &o
     collect_keys(&g_map.ht1);
     collect_keys(&g_map.ht2);
 
-    out_arr(out, (uint32_t)keys.size());
+    resp_out_arr_header(out, keys.size());
     for (const std::string &k : keys) {
-        out_str(out, k);
+        resp_out_bulk(out, k);
     }
 }
 
-// --------------------------------------------------------------------------
-// ZSet commands
-// --------------------------------------------------------------------------
-
-static void do_zadd(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_zadd(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 4) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zadd' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'zadd' command");
         return;
     }
     double score = 0;
     try {
         score = std::stod(cmd[2]);
     } catch (...) {
-        out_err(out, ERR_BADARGS, "ERR value is not a valid float");
+        resp_out_err(out, "ERR value is not a valid float");
         return;
     }
     
@@ -540,89 +493,91 @@ static void do_zadd(const std::vector<std::string> &cmd, std::vector<uint8_t> &o
         hm_insert(&g_map, &ent->node);
     } else {
         if (ent->type != T_ZSET) {
-            out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+            resp_out_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
             return;
         }
     }
     
     bool added = zset_add(ent->zset, cmd[3].data(), cmd[3].size(), score);
-    out_int(out, added ? 1 : 0);
+    resp_out_int(out, added ? 1 : 0);
 }
 
-static void do_zscore(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_zscore(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 3) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zscore' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'zscore' command");
         return;
     }
     
     Entry *ent = get_live_entry(cmd[1]);
     if (!ent) {
-        out_nil(out);
+        resp_out_null_bulk(out);
         return;
     }
     if (ent->type != T_ZSET) {
-        out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        resp_out_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
         return;
     }
     
     ZNode *zn = zset_lookup(ent->zset, cmd[2].data(), cmd[2].size());
     if (zn) {
-        out_dbl(out, zn->score);
+        char sbuf[64];
+        snprintf(sbuf, sizeof(sbuf), "%.17g", zn->score);
+        resp_out_bulk(out, sbuf);
     } else {
-        out_nil(out);
+        resp_out_null_bulk(out);
     }
 }
 
-static void do_zrem(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_zrem(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 3) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zrem' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'zrem' command");
         return;
     }
     Entry *ent = get_live_entry(cmd[1]);
     if (!ent) {
-        out_int(out, 0);
+        resp_out_int(out, 0);
         return;
     }
     if (ent->type != T_ZSET) {
-        out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        resp_out_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
         return;
     }
     
     ZNode *zn = zset_pop(ent->zset, cmd[2].data(), cmd[2].size());
     if (zn) {
         delete zn;
-        out_int(out, 1);
+        resp_out_int(out, 1);
     } else {
-        out_int(out, 0);
+        resp_out_int(out, 0);
     }
 }
 
-static void do_zrank(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_zrank(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 3) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zrank' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'zrank' command");
         return;
     }
     Entry *ent = get_live_entry(cmd[1]);
     if (!ent) {
-        out_nil(out);
+        resp_out_null_bulk(out);
         return;
     }
     if (ent->type != T_ZSET) {
-        out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        resp_out_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
         return;
     }
     
     int64_t rank = zset_rank(ent->zset, cmd[2].data(), cmd[2].size());
     if (rank >= 0) {
-        out_int(out, rank);
+        resp_out_int(out, rank);
     } else {
-        out_nil(out);
+        resp_out_null_bulk(out);
     }
 }
 
-static void do_zquery(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_zquery(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 6) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zquery' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'zquery' command");
         return;
     }
     double score = 0;
@@ -633,37 +588,35 @@ static void do_zquery(const std::vector<std::string> &cmd, std::vector<uint8_t> 
         offset = std::stoll(cmd[4]);
         limit = std::stoll(cmd[5]);
     } catch (...) {
-        out_err(out, ERR_BADARGS, "ERR value is not a valid float or integer");
+        resp_out_err(out, "ERR value is not a valid float or integer");
         return;
     }
     
     Entry *ent = get_live_entry(cmd[1]);
     if (!ent) {
-        out_arr(out, 0);
+        resp_out_arr_header(out, 0);
         return;
     }
     if (ent->type != T_ZSET) {
-        out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        resp_out_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
         return;
     }
     
     std::vector<std::pair<std::string, double>> res;
     zset_query(ent->zset, score, cmd[3].data(), cmd[3].size(), offset, limit, res);
     
-    out_arr(out, (uint32_t)(res.size() * 2));
+    resp_out_arr_header(out, res.size() * 2);
     for (const auto &p : res) {
-        out_str(out, p.first);
-        out_dbl(out, p.second);
+        resp_out_bulk(out, p.first);
+        char sbuf[64];
+        snprintf(sbuf, sizeof(sbuf), "%.17g", p.second);
+        resp_out_bulk(out, sbuf);
     }
 }
 
-// --------------------------------------------------------------------------
-// TTL commands (Chapter 13)
-// --------------------------------------------------------------------------
-
-static void do_expire(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_expire(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 3) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'expire' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'expire' command");
         return;
     }
 
@@ -671,21 +624,19 @@ static void do_expire(const std::vector<std::string> &cmd, std::vector<uint8_t> 
     try {
         ttl_sec = std::stoll(cmd[2]);
     } catch (...) {
-        out_err(out, ERR_BADARGS, "ERR value is not an integer or out of range");
+        resp_out_err(out, "ERR value is not an integer or out of range");
         return;
     }
 
     Entry *ent = get_live_entry(cmd[1]);
     if (!ent) {
-        // Key doesn't exist or already expired
-        out_int(out, 0);
+        resp_out_int(out, 0);
         return;
     }
 
     if (ttl_sec <= 0) {
-        // Non-positive TTL expires and deletes the key immediately
         detach_and_free_entry(ent);
-        out_int(out, 1);
+        resp_out_int(out, 1);
         return;
     }
 
@@ -693,19 +644,17 @@ static void do_expire(const std::vector<std::string> &cmd, std::vector<uint8_t> 
     uint64_t expire_us = now_us + (uint64_t)ttl_sec * 1000000ULL;
 
     if (ent->heap_idx != (size_t)-1) {
-        // Update existing heap position in O(log n)
         heap_update_val(g_heap, ent->heap_idx, expire_us);
     } else {
-        // Push new heap node in O(log n)
         heap_insert(g_heap, expire_us, &ent->heap_idx);
     }
 
-    out_int(out, 1);
+    resp_out_int(out, 1);
 }
 
-static void do_pexpire(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_pexpire(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 3) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'pexpire' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'pexpire' command");
         return;
     }
 
@@ -713,19 +662,19 @@ static void do_pexpire(const std::vector<std::string> &cmd, std::vector<uint8_t>
     try {
         ttl_ms = std::stoll(cmd[2]);
     } catch (...) {
-        out_err(out, ERR_BADARGS, "ERR value is not an integer or out of range");
+        resp_out_err(out, "ERR value is not an integer or out of range");
         return;
     }
 
     Entry *ent = get_live_entry(cmd[1]);
     if (!ent) {
-        out_int(out, 0);
+        resp_out_int(out, 0);
         return;
     }
 
     if (ttl_ms <= 0) {
         detach_and_free_entry(ent);
-        out_int(out, 1);
+        resp_out_int(out, 1);
         return;
     }
 
@@ -738,25 +687,23 @@ static void do_pexpire(const std::vector<std::string> &cmd, std::vector<uint8_t>
         heap_insert(g_heap, expire_us, &ent->heap_idx);
     }
 
-    out_int(out, 1);
+    resp_out_int(out, 1);
 }
 
-static void do_ttl(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_ttl(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 2) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'ttl' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'ttl' command");
         return;
     }
 
     Entry *ent = get_live_entry(cmd[1]);
     if (!ent) {
-        // -2 if the key does not exist (or has expired)
-        out_int(out, -2);
+        resp_out_int(out, -2);
         return;
     }
 
     if (ent->heap_idx == (size_t)-1) {
-        // -1 if the key exists but has no associated expire
-        out_int(out, -1);
+        resp_out_int(out, -1);
         return;
     }
 
@@ -764,29 +711,28 @@ static void do_ttl(const std::vector<std::string> &cmd, std::vector<uint8_t> &ou
     uint64_t expire_us = g_heap[ent->heap_idx].val;
     if (expire_us <= now_us) {
         detach_and_free_entry(ent);
-        out_int(out, -2);
+        resp_out_int(out, -2);
         return;
     }
 
-    // Ceil division so that remaining time > 0 returns at least 1 second
     int64_t remain_sec = (int64_t)((expire_us - now_us + 999999ULL) / 1000000ULL);
-    out_int(out, remain_sec);
+    resp_out_int(out, remain_sec);
 }
 
-static void do_pttl(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_pttl(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 2) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'pttl' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'pttl' command");
         return;
     }
 
     Entry *ent = get_live_entry(cmd[1]);
     if (!ent) {
-        out_int(out, -2);
+        resp_out_int(out, -2);
         return;
     }
 
     if (ent->heap_idx == (size_t)-1) {
-        out_int(out, -1);
+        resp_out_int(out, -1);
         return;
     }
 
@@ -794,93 +740,96 @@ static void do_pttl(const std::vector<std::string> &cmd, std::vector<uint8_t> &o
     uint64_t expire_us = g_heap[ent->heap_idx].val;
     if (expire_us <= now_us) {
         detach_and_free_entry(ent);
-        out_int(out, -2);
+        resp_out_int(out, -2);
         return;
     }
 
     int64_t remain_ms = (int64_t)((expire_us - now_us + 999ULL) / 1000ULL);
-    out_int(out, remain_ms);
+    resp_out_int(out, remain_ms);
 }
 
-static void do_persist(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_persist(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 2) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'persist' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'persist' command");
         return;
     }
 
     Entry *ent = get_live_entry(cmd[1]);
     if (!ent) {
-        out_int(out, 0); // Key does not exist
+        resp_out_int(out, 0);
         return;
     }
 
     if (ent->heap_idx == (size_t)-1) {
-        out_int(out, 0); // Key has no associated timeout
+        resp_out_int(out, 0);
         return;
     }
 
-    // Remove from heap and reset heap_idx to (size_t)-1
     heap_delete(g_heap, ent->heap_idx);
-    out_int(out, 1); // Timeout removed
+    resp_out_int(out, 1);
 }
 
-// --------------------------------------------------------------------------
-// Utility and Benchmark helper commands (PING, CONFIG, ZPOPULATE)
-// --------------------------------------------------------------------------
-
-static void do_ping(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_ping(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() == 1) {
-        out_str(out, "PONG");
+        resp_out_str(out, "PONG");
     } else if (cmd.size() == 2) {
-        out_str(out, cmd[1]);
+        resp_out_bulk(out, cmd[1]);
     } else {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'ping' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'ping' command");
     }
 }
 
-static void do_config(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_echo(const std::vector<std::string> &cmd, std::string &out) {
+    if (cmd.size() != 2) {
+        resp_out_err(out, "ERR wrong number of arguments for 'echo' command");
+    } else {
+        resp_out_bulk(out, cmd[1]);
+    }
+}
+
+static void do_config(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() >= 3 && (cmd[1] == "set" || cmd[1] == "SET")) {
         if (cmd[2] == "lazyfree" || cmd[2] == "LAZYFREE") {
             if (cmd.size() < 4) {
-                out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'config set'");
+                resp_out_err(out, "ERR wrong number of arguments for 'config set'");
                 return;
             }
             if (cmd[3] == "1" || cmd[3] == "yes" || cmd[3] == "true") {
                 g_lazyfree_enabled = true;
-                out_str(out, "OK");
+                resp_out_str(out, "OK");
             } else if (cmd[3] == "0" || cmd[3] == "no" || cmd[3] == "false") {
                 g_lazyfree_enabled = false;
-                out_str(out, "OK");
+                resp_out_str(out, "OK");
             } else {
-                out_err(out, ERR_BADARGS, "ERR value must be 0 or 1");
+                resp_out_err(out, "ERR value must be 0 or 1");
             }
             return;
         }
     } else if (cmd.size() >= 3 && (cmd[1] == "get" || cmd[1] == "GET")) {
         if (cmd[2] == "lazyfree" || cmd[2] == "LAZYFREE") {
-            out_arr(out, 2);
-            out_str(out, "lazyfree");
-            out_str(out, g_lazyfree_enabled ? "yes" : "no");
+            resp_out_arr_header(out, 2);
+            resp_out_bulk(out, "lazyfree");
+            resp_out_bulk(out, g_lazyfree_enabled ? "yes" : "no");
             return;
         }
     }
-    out_err(out, ERR_UNKNOWN, "ERR unsupported config command");
+    resp_out_err(out, "ERR unsupported config command");
 }
 
-static void do_zpopulate(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
+static void do_zpopulate(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 3) {
-        out_err(out, ERR_BADARGS, "ERR wrong number of arguments for 'zpopulate' command");
+        resp_out_err(out, "ERR wrong number of arguments for 'zpopulate' command");
         return;
     }
     int64_t count = 0;
     try {
         count = std::stoll(cmd[2]);
     } catch (...) {
-        out_err(out, ERR_BADARGS, "ERR invalid count");
+        resp_out_err(out, "ERR invalid count");
         return;
     }
     if (count <= 0) {
-        out_int(out, 0);
+        resp_out_int(out, 0);
         return;
     }
 
@@ -895,7 +844,7 @@ static void do_zpopulate(const std::vector<std::string> &cmd, std::vector<uint8_
         zset_init(ent->zset);
         hm_insert(&g_map, &ent->node);
     } else if (ent->type != T_ZSET) {
-        out_err(out, ERR_BADARGS, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        resp_out_err(out, "WRONGTYPE Operation against a key holding the wrong kind of value");
         return;
     }
 
@@ -906,185 +855,149 @@ static void do_zpopulate(const std::vector<std::string> &cmd, std::vector<uint8_
             added++;
         }
     }
-    out_int(out, added);
+    resp_out_int(out, added);
 }
 
 // --------------------------------------------------------------------------
 // Command dispatch — the central router.
 // --------------------------------------------------------------------------
-static void do_request(const std::vector<std::string> &cmd, std::vector<uint8_t> &out) {
-    if (cmd.size() == 0) {
-        out_err(out, ERR_UNKNOWN, "ERR empty command");
+static void do_request(const std::vector<std::string> &cmd, std::string &out, bool &want_close) {
+    if (cmd.empty()) {
         return;
     }
 
-    // Case-insensitive command matching.
-    if (cmd[0] == "get" || cmd[0] == "GET") {
-        do_get(cmd, out);
-    } else if (cmd[0] == "set" || cmd[0] == "SET") {
-        do_set(cmd, out);
-    } else if (cmd[0] == "del" || cmd[0] == "DEL" || cmd[0] == "unlink" || cmd[0] == "UNLINK") {
-        do_del(cmd, out);
-    } else if (cmd[0] == "ping" || cmd[0] == "PING") {
+    std::string c = cmd[0];
+    for (char &ch : c) ch = (char)toupper((unsigned char)ch);
+
+    if (c == "PING") {
         do_ping(cmd, out);
-    } else if (cmd[0] == "config" || cmd[0] == "CONFIG") {
+    } else if (c == "ECHO") {
+        do_echo(cmd, out);
+    } else if (c == "QUIT") {
+        resp_out_str(out, "OK");
+        want_close = true;
+    } else if (c == "COMMAND") {
+        // Modern redis-cli sends COMMAND / COMMAND DOCS on connect
+        resp_out_arr_header(out, 0); // Empty array: *0\r\n
+    } else if (c == "HELLO") {
+        // Fall back gracefully to RESP2
+        resp_out_err(out, "ERR unknown command 'HELLO'");
+    } else if (c == "CLIENT") {
+        resp_out_str(out, "OK");
+    } else if (c == "GET") {
+        do_get(cmd, out);
+    } else if (c == "SET") {
+        do_set(cmd, out);
+    } else if (c == "DEL" || c == "UNLINK") {
+        do_del(cmd, out);
+    } else if (c == "CONFIG") {
         do_config(cmd, out);
-    } else if (cmd[0] == "zpopulate" || cmd[0] == "ZPOPULATE") {
+    } else if (c == "ZPOPULATE") {
         do_zpopulate(cmd, out);
-    } else if (cmd[0] == "exists" || cmd[0] == "EXISTS") {
+    } else if (c == "EXISTS") {
         do_exists(cmd, out);
-    } else if (cmd[0] == "keys" || cmd[0] == "KEYS") {
+    } else if (c == "KEYS") {
         do_keys(cmd, out);
-    } else if (cmd[0] == "expire" || cmd[0] == "EXPIRE") {
+    } else if (c == "EXPIRE") {
         do_expire(cmd, out);
-    } else if (cmd[0] == "pexpire" || cmd[0] == "PEXPIRE") {
+    } else if (c == "PEXPIRE") {
         do_pexpire(cmd, out);
-    } else if (cmd[0] == "ttl" || cmd[0] == "TTL") {
+    } else if (c == "TTL") {
         do_ttl(cmd, out);
-    } else if (cmd[0] == "pttl" || cmd[0] == "PTTL") {
+    } else if (c == "PTTL") {
         do_pttl(cmd, out);
-    } else if (cmd[0] == "persist" || cmd[0] == "PERSIST") {
+    } else if (c == "PERSIST") {
         do_persist(cmd, out);
-    } else if (cmd[0] == "zadd" || cmd[0] == "ZADD") {
+    } else if (c == "ZADD") {
         do_zadd(cmd, out);
-    } else if (cmd[0] == "zscore" || cmd[0] == "ZSCORE") {
+    } else if (c == "ZSCORE") {
         do_zscore(cmd, out);
-    } else if (cmd[0] == "zrem" || cmd[0] == "ZREM") {
+    } else if (c == "ZREM") {
         do_zrem(cmd, out);
-    } else if (cmd[0] == "zrank" || cmd[0] == "ZRANK") {
+    } else if (c == "ZRANK") {
         do_zrank(cmd, out);
-    } else if (cmd[0] == "zquery" || cmd[0] == "ZQUERY") {
+    } else if (c == "ZQUERY") {
         do_zquery(cmd, out);
     } else {
-        out_err(out, ERR_UNKNOWN, "ERR unknown command");
+        resp_out_err(out, "ERR unknown command '" + cmd[0] + "'");
     }
 }
 
 // --------------------------------------------------------------------------
-// Response serialization — write the typed output into the connection's wbuf.
-//
-// BEFORE: serialize_res(status, data, conn) — wrote [total_len][status][data]
-// AFTER:  serialize_res(out, conn) — writes [total_len][serialized typed value]
-//
-// The "status" is gone — it's embedded in the type tag. The outer frame is
-// still [4-byte LE length][payload], same as before. Only the payload format
-// changed from [status:u32][raw bytes] to [type_tag:u8][type-specific data].
+// Request processing & Connection IO
 // --------------------------------------------------------------------------
-static void serialize_res(const std::vector<uint8_t> &out, Conn *conn) {
-    uint32_t total_len = (uint32_t)out.size();
-    memcpy(conn->wbuf, &total_len, 4);
-    if (out.size() > 0) {
-        memcpy(conn->wbuf + 4, out.data(), out.size());
-    }
-    conn->wbuf_size = 4 + total_len;
-    conn->wbuf_sent = 0;
-    conn->state = STATE_WRITE;
-}
-
-// --------------------------------------------------------------------------
-// try_one_request — parse one request from rbuf, execute it, serialize the
-// response into wbuf.
-// --------------------------------------------------------------------------
-static bool try_one_request(Conn *conn) {
-    if (conn->rbuf_size < 4) {
-        return false;
-    }
-
-    uint32_t len = 0;
-    memcpy(&len, conn->rbuf, 4);
-
-    if (len > k_max_msg) {
-        fprintf(stderr, "try_one_request: message too long: %u bytes (max %u)\n",
-                len, (unsigned)k_max_msg);
-        conn->want_close = true;
-        return false;
-    }
-
-    if (conn->rbuf_size < 4 + len) {
-        return false;   // not yet — wait for more bytes from the next recv()
-    }
-
-    // Phase 1: Parse
-    std::vector<std::string> cmd;
-    if (!parse_req(&conn->rbuf[4], len, cmd)) {
-        fprintf(stderr, "try_one_request: failed to parse request format\n");
-        conn->want_close = true;
-        return false;
-    }
-
-    // Phase 2: Execute + Serialize into typed output
-    std::vector<uint8_t> out;
-    do_request(cmd, out);
-
-    // Phase 3: Frame and write to wbuf
-    serialize_res(out, conn);
-
-    // Compact rbuf: remove the consumed message
-    size_t consumed = 4 + len;
-    size_t remaining = conn->rbuf_size - consumed;
-    if (remaining > 0) {
-        memmove(conn->rbuf, &conn->rbuf[consumed], remaining);
-    }
-    conn->rbuf_size = remaining;
-
-    return true;
-}
-
-// --------------------------------------------------------------------------
-// state_read — handle a POLLIN event for this connection.
-// --------------------------------------------------------------------------
-static void state_read(Conn *conn) {
-    size_t cap = sizeof(conn->rbuf) - conn->rbuf_size;
-    if (cap == 0) {
-        if (!try_one_request(conn)) {
-            fprintf(stderr, "state_read: rbuf full, cannot parse\n");
-            conn->want_close = true;
+static void process_rbuf(Conn *conn) {
+    size_t rbuf_idx = 0;
+    while (rbuf_idx < conn->rbuf.size()) {
+        size_t consumed = 0;
+        std::vector<std::string> cmd;
+        ParseStatus st = parse_request(
+            (const uint8_t *)conn->rbuf.data() + rbuf_idx,
+            conn->rbuf.size() - rbuf_idx,
+            consumed,
+            cmd
+        );
+        if (st == PARSE_NEED_MORE) {
+            break;
         }
-        return;
+        if (st == PARSE_ERR) {
+            fprintf(stderr, "Protocol error on fd %u, closing connection.\n", (unsigned)conn->fd);
+            conn->want_close = true;
+            break;
+        }
+        rbuf_idx += consumed;
+        if (!cmd.empty()) {
+            do_request(cmd, conn->wbuf, conn->want_close);
+            if (conn->want_close) break;
+        }
     }
+    if (rbuf_idx > 0) {
+        conn->rbuf.erase(0, rbuf_idx);
+    }
+}
 
-    int rv = recv(conn->fd,
-                  (char *)&conn->rbuf[conn->rbuf_size],
-                  (int)cap,
-                  0);
+static void state_read(Conn *conn) {
+    char buf[64 * 1024];
+    int rv = recv(conn->fd, buf, sizeof(buf), 0);
 
     if (rv == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK) {
             return;
         }
-        fprintf(stderr, "recv() error on fd %u: %d\n",
-                (unsigned)conn->fd, err);
+        fprintf(stderr, "recv() error on fd %u: %d\n", (unsigned)conn->fd, err);
         conn->want_close = true;
         return;
     }
 
     if (rv == 0) {
-        printf("Client disconnected (fd=%u).\n",
-               (unsigned)conn->fd);
+        printf("Client disconnected (fd=%u).\n", (unsigned)conn->fd);
         conn->want_close = true;
         return;
     }
 
-    conn->rbuf_size += (size_t)rv;
-
-    // Moving connection to the tail of the idle list whenever it does IO
+    conn->rbuf.append(buf, (size_t)rv);
     conn_touch(conn);
 
-    while (try_one_request(conn)) {
-        if (conn->state == STATE_WRITE) {
-            return;
-        }
+    process_rbuf(conn);
+
+    if (!conn->wbuf.empty()) {
+        conn->state = STATE_WRITE;
+        state_write(conn);
     }
 }
 
-// --------------------------------------------------------------------------
-// state_write — handle a POLLOUT event for this connection.
-// --------------------------------------------------------------------------
 static void state_write(Conn *conn) {
+    if (conn->wbuf_sent >= conn->wbuf.size()) {
+        conn->wbuf.clear();
+        conn->wbuf_sent = 0;
+        conn->state = STATE_READ;
+        return;
+    }
+
     int rv = send(conn->fd,
-                  (const char *)&conn->wbuf[conn->wbuf_sent],
-                  (int)(conn->wbuf_size - conn->wbuf_sent),
+                  conn->wbuf.data() + conn->wbuf_sent,
+                  (int)(conn->wbuf.size() - conn->wbuf_sent),
                   0);
 
     if (rv == SOCKET_ERROR) {
@@ -1092,25 +1005,27 @@ static void state_write(Conn *conn) {
         if (err == WSAEWOULDBLOCK) {
             return;
         }
-        fprintf(stderr, "send() error on fd %u: %d\n",
-                (unsigned)conn->fd, err);
+        fprintf(stderr, "send() error on fd %u: %d\n", (unsigned)conn->fd, err);
         conn->want_close = true;
         return;
     }
 
     conn->wbuf_sent += (size_t)rv;
-
-    // Moving connection to the tail of the idle list whenever it does IO
     conn_touch(conn);
 
-    if (conn->wbuf_sent == conn->wbuf_size) {
-        conn->state = STATE_READ;
-        conn->wbuf_size = 0;
+    if (conn->wbuf_sent == conn->wbuf.size()) {
+        conn->wbuf.clear();
         conn->wbuf_sent = 0;
+        conn->state = STATE_READ;
 
-        while (try_one_request(conn)) {
-            if (conn->state == STATE_WRITE) {
-                return;
+        if (conn->want_close) {
+            return;
+        }
+
+        if (!conn->rbuf.empty()) {
+            process_rbuf(conn);
+            if (!conn->wbuf.empty()) {
+                conn->state = STATE_WRITE;
             }
         }
     }
@@ -1138,10 +1053,10 @@ static void conn_accept(SOCKET listen_fd, std::vector<Conn *> &connections) {
         set_nonblocking(conn_fd);
 
         Conn *conn = new Conn();
-        memset(conn, 0, sizeof(Conn));
         conn->fd = conn_fd;
         conn->state = STATE_READ;
         conn->want_close = false;
+        conn->wbuf_sent = 0;
         dlist_init(&conn->idle_list);
         conn_touch(conn);
 

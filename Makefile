@@ -21,10 +21,10 @@ heap.o: $(SRCDIR)/heap.cpp $(SRCDIR)/heap.h
 thread_pool.o: $(SRCDIR)/thread_pool.cpp $(SRCDIR)/thread_pool.h
 	$(CXX) $(CXXFLAGS) -c -o $@ $(SRCDIR)/thread_pool.cpp
 
-server.exe: $(SRCDIR)/server.cpp $(SRCDIR)/hashtable.h $(SRCDIR)/serialization.h $(SRCDIR)/avl.h $(SRCDIR)/zset.h $(SRCDIR)/dlist.h $(SRCDIR)/heap.h $(SRCDIR)/thread_pool.h hashtable.o avl.o zset.o heap.o thread_pool.o
+server.exe: $(SRCDIR)/server.cpp $(SRCDIR)/hashtable.h $(SRCDIR)/resp.h $(SRCDIR)/avl.h $(SRCDIR)/zset.h $(SRCDIR)/dlist.h $(SRCDIR)/heap.h $(SRCDIR)/thread_pool.h hashtable.o avl.o zset.o heap.o thread_pool.o
 	$(CXX) $(CXXFLAGS) -o $@ $(SRCDIR)/server.cpp hashtable.o avl.o zset.o heap.o thread_pool.o $(LDFLAGS)
 
-client.exe: $(SRCDIR)/client.cpp $(SRCDIR)/serialization.h
+client.exe: $(SRCDIR)/client.cpp $(SRCDIR)/resp.h
 	$(CXX) $(CXXFLAGS) -o $@ $(SRCDIR)/client.cpp $(LDFLAGS)
 
 test_oversized.exe: $(TESTDIR)/test_oversized.cpp
@@ -33,7 +33,7 @@ test_oversized.exe: $(TESTDIR)/test_oversized.cpp
 test_concurrent.exe: $(TESTDIR)/test_concurrent.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 
-test_commands.exe: $(TESTDIR)/test_commands.cpp $(SRCDIR)/serialization.h
+test_commands.exe: $(TESTDIR)/test_commands.cpp $(SRCDIR)/resp.h
 	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_commands.cpp $(LDFLAGS)
 
 test_hashtable.exe: $(TESTDIR)/test_hashtable.cpp $(SRCDIR)/hashtable.h hashtable.o
@@ -48,19 +48,19 @@ test_zset.exe: $(TESTDIR)/test_zset.cpp $(SRCDIR)/zset.h zset.o hashtable.o avl.
 test_dlist.exe: $(TESTDIR)/test_dlist.cpp $(SRCDIR)/dlist.h $(SRCDIR)/hashtable.h
 	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_dlist.cpp
 
-test_timers.exe: $(TESTDIR)/test_timers.cpp $(SRCDIR)/serialization.h
+test_timers.exe: $(TESTDIR)/test_timers.cpp $(SRCDIR)/resp.h
 	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_timers.cpp $(LDFLAGS)
 
 test_heap.exe: $(TESTDIR)/test_heap.cpp $(SRCDIR)/heap.h heap.o
 	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_heap.cpp heap.o
 
-test_ttl.exe: $(TESTDIR)/test_ttl.cpp $(SRCDIR)/serialization.h
+test_ttl.exe: $(TESTDIR)/test_ttl.cpp $(SRCDIR)/resp.h
 	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_ttl.cpp $(LDFLAGS)
 
 test_thread_pool.exe: $(TESTDIR)/test_thread_pool.cpp $(SRCDIR)/thread_pool.h thread_pool.o
 	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_thread_pool.cpp thread_pool.o
 
-test_lazyfree.exe: $(TESTDIR)/test_lazyfree.cpp $(SRCDIR)/serialization.h
+test_lazyfree.exe: $(TESTDIR)/test_lazyfree.cpp $(SRCDIR)/resp.h
 	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_lazyfree.cpp $(LDFLAGS)
 
 clean:

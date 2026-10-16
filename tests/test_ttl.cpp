@@ -21,9 +21,7 @@
 #include <string>
 #include <chrono>
 #include <thread>
-#include "../src/serialization.h"
-
-static const size_t k_max_msg = 4096;
+#include "../src/resp.h"
 
 #define CHECK(cond, msg) \
     do { \
@@ -32,63 +30,6 @@ static const size_t k_max_msg = 4096;
             exit(1); \
         } \
     } while (0)
-
-static int write_full(SOCKET fd, const char *buf, size_t n) {
-    while (n > 0) {
-        int rv = send(fd, buf, (int)n, 0);
-        if (rv <= 0) return -1;
-        buf += rv;
-        n -= (size_t)rv;
-    }
-    return 0;
-}
-
-static int read_full(SOCKET fd, char *buf, size_t n) {
-    while (n > 0) {
-        int rv = recv(fd, buf, (int)n, 0);
-        if (rv <= 0) return -1;
-        buf += rv;
-        n -= (size_t)rv;
-    }
-    return 0;
-}
-
-static int send_request(SOCKET fd, const std::vector<std::string> &cmd) {
-    uint32_t len = 4;
-    for (const std::string &s : cmd) {
-        len += 4 + (uint32_t)s.size();
-    }
-    char header[4];
-    memcpy(header, &len, 4);
-    if (write_full(fd, header, 4) != 0) return -1;
-
-    uint32_t nstr = (uint32_t)cmd.size();
-    char nstr_buf[4];
-    memcpy(nstr_buf, &nstr, 4);
-    if (write_full(fd, nstr_buf, 4) != 0) return -1;
-
-    for (const std::string &s : cmd) {
-        uint32_t slen = (uint32_t)s.size();
-        char slen_buf[4];
-        memcpy(slen_buf, &slen, 4);
-        if (write_full(fd, slen_buf, 4) != 0) return -1;
-        if (write_full(fd, s.data(), s.size()) != 0) return -1;
-    }
-    return 0;
-}
-
-static int read_response_raw(SOCKET fd, std::vector<uint8_t> &out) {
-    char header[4];
-    if (read_full(fd, header, 4) != 0) return -1;
-    uint32_t len = 0;
-    memcpy(&len, header, 4);
-    if (len > k_max_msg) return -1;
-    out.resize(len);
-    if (len > 0) {
-        if (read_full(fd, (char *)out.data(), len) != 0) return -1;
-    }
-    return 0;
-}
 
 static SOCKET connect_server() {
     SOCKET fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -105,38 +46,26 @@ static SOCKET connect_server() {
 }
 
 static int64_t req_int(SOCKET fd, const std::vector<std::string> &cmd) {
-    CHECK(send_request(fd, cmd) == 0, "send_request failed");
-    std::vector<uint8_t> resp;
-    CHECK(read_response_raw(fd, resp) == 0, "read_response failed");
-    CHECK(resp.size() >= 1 && resp[0] == SER_INT, "Expected SER_INT response");
-    const uint8_t *p = resp.data();
-    size_t len = resp.size();
-    uint8_t tag;
-    read_u8(p, len, tag);
-    int64_t val = 0;
-    CHECK(read_i64(p, len, val), "Failed to read i64");
-    return val;
+    CHECK(resp_send_cmd(fd, cmd) == 0, "resp_send_cmd failed");
+    RespValue resp;
+    CHECK(resp_read_val(fd, resp) == 0, "resp_read_val failed");
+    CHECK(resp.type == RESP_INT, "Expected RESP_INT response");
+    return resp.int_val;
 }
 
 static std::string req_str(SOCKET fd, const std::vector<std::string> &cmd) {
-    CHECK(send_request(fd, cmd) == 0, "send_request failed");
-    std::vector<uint8_t> resp;
-    CHECK(read_response_raw(fd, resp) == 0, "read_response failed");
-    CHECK(resp.size() >= 1 && resp[0] == SER_STR, "Expected SER_STR response");
-    const uint8_t *p = resp.data();
-    size_t len = resp.size();
-    uint8_t tag;
-    read_u8(p, len, tag);
-    std::string val;
-    CHECK(read_str(p, len, val), "Failed to read str");
-    return val;
+    CHECK(resp_send_cmd(fd, cmd) == 0, "resp_send_cmd failed");
+    RespValue resp;
+    CHECK(resp_read_val(fd, resp) == 0, "resp_read_val failed");
+    CHECK(resp.type == RESP_STR, "Expected RESP_STR response");
+    return resp.str_val;
 }
 
 static bool req_is_nil(SOCKET fd, const std::vector<std::string> &cmd) {
-    CHECK(send_request(fd, cmd) == 0, "send_request failed");
-    std::vector<uint8_t> resp;
-    CHECK(read_response_raw(fd, resp) == 0, "read_response failed");
-    return (resp.size() >= 1 && resp[0] == SER_NIL);
+    CHECK(resp_send_cmd(fd, cmd) == 0, "resp_send_cmd failed");
+    RespValue resp;
+    CHECK(resp_read_val(fd, resp) == 0, "resp_read_val failed");
+    return (resp.type == RESP_NIL);
 }
 
 int main() {

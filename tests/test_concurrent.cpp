@@ -18,6 +18,8 @@
 #include <cstring>
 #include <cstdint>
 
+#include "../src/resp.h"
+
 // Match the server's limit
 static const size_t k_max_msg = 4096;
 
@@ -25,80 +27,21 @@ static const size_t k_max_msg = 4096;
 static const int NUM_CLIENTS = 50;
 static const int REQUESTS_PER_CLIENT = 5;
 
-
-// --------------------------------------------------------------------------
-// Blocking helpers (for the test client — same as client.cpp from Part 2)
-// --------------------------------------------------------------------------
-static int read_full(SOCKET fd, char *buf, size_t n) {
-    while (n > 0) {
-        int rv = recv(fd, buf, (int)n, 0);
-        if (rv == SOCKET_ERROR) return -1;
-        if (rv == 0) return -1;
-        buf += rv;
-        n -= (size_t)rv;
-    }
-    return 0;
-}
-
-static int write_full(SOCKET fd, const char *buf, size_t n) {
-    while (n > 0) {
-        int rv = send(fd, buf, (int)n, 0);
-        if (rv == SOCKET_ERROR) return -1;
-        buf += rv;
-        n -= (size_t)rv;
-    }
-    return 0;
-}
-
 static int send_request(SOCKET fd, const char *text) {
-    uint32_t len = 4 + (4 + 3) + (4 + (uint32_t)strlen(text)); // nstr + (len+GET) + (len+text)
-    char header[4];
-    memcpy(header, &len, 4);
-    if (write_full(fd, header, 4) != 0) return -1;
-    
-    uint32_t nstr = 2;
-    if (write_full(fd, (char*)&nstr, 4) != 0) return -1;
-    
-    uint32_t len1 = 3;
-    if (write_full(fd, (char*)&len1, 4) != 0) return -1;
-    if (write_full(fd, "GET", 3) != 0) return -1;
-    
-    uint32_t len2 = (uint32_t)strlen(text);
-    if (write_full(fd, (char*)&len2, 4) != 0) return -1;
-    if (write_full(fd, text, len2) != 0) return -1;
-
-    return 0;
+    return resp_send_cmd(fd, {"GET", text});
 }
 
-static int read_response(SOCKET fd, char *out_buf, size_t out_cap) {
-    char header[4];
-    if (read_full(fd, header, 4) != 0) {
-        fprintf(stderr, "read_full header failed\n");
+static int read_response(SOCKET fd, std::string &rbuf, char *out_buf, size_t out_cap) {
+    RespValue resp;
+    if (resp_read_val(fd, rbuf, resp) != 0) {
         return -1;
     }
-
-    uint32_t len = 0;
-    memcpy(&len, header, 4);
-    if (len > k_max_msg || len >= out_cap + 4) {
-        fprintf(stderr, "invalid len %u\n", len);
-        return -1;
+    if (resp.type == RESP_NIL) {
+        snprintf(out_buf, out_cap, "(nil)");
+        return 5;
     }
-
-    uint32_t status = 0;
-    if (read_full(fd, (char*)&status, 4) != 0) {
-        fprintf(stderr, "read_full status failed\n");
-        return -1;
-    }
-
-    uint32_t data_len = len - 4;
-    if (data_len > 0) {
-        if (read_full(fd, out_buf, data_len) != 0) {
-            fprintf(stderr, "read_full payload failed (data_len=%u)\n", data_len);
-            return -1;
-        }
-    }
-    out_buf[data_len] = '\0';
-    return (int)data_len;
+    snprintf(out_buf, out_cap, "%s", resp.str_val.c_str());
+    return (int)resp.str_val.size();
 }
 
 int main() {
@@ -120,6 +63,7 @@ int main() {
 
     // --- Phase 1: Create and connect all sockets ---
     SOCKET fds[NUM_CLIENTS];
+    std::string rbufs[NUM_CLIENTS];
     int connected = 0;
 
     for (int i = 0; i < NUM_CLIENTS; i++) {
@@ -184,7 +128,7 @@ int main() {
     for (int i = 0; i < NUM_CLIENTS; i++) {
         for (int j = 0; j < REQUESTS_PER_CLIENT; j++) {
             char response[k_max_msg + 1];
-            int len = read_response(fds[i], response, sizeof(response));
+            int len = read_response(fds[i], rbufs[i], response, sizeof(response));
             if (len < 0) {
                 fprintf(stderr, "[FAIL] read_response client %d req %d\n", i, j);
                 recv_failures++;

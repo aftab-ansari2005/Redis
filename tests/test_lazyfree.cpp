@@ -39,9 +39,7 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
-#include "../src/serialization.h"
-
-static const size_t k_max_msg = 4096;
+#include "../src/resp.h"
 
 static void die(const char *msg) {
     fprintf(stderr, "[FAIL] %s (WSA error: %d)\n", msg, WSAGetLastError());
@@ -49,62 +47,12 @@ static void die(const char *msg) {
     exit(1);
 }
 
-// --------------------------------------------------------------------------
-// Socket IO helpers
-// --------------------------------------------------------------------------
-static int read_full(SOCKET fd, char *buf, size_t n) {
-    while (n > 0) {
-        int rv = recv(fd, buf, (int)n, 0);
-        if (rv <= 0) return -1;
-        buf += rv;
-        n -= (size_t)rv;
-    }
-    return 0;
+static inline int send_request(SOCKET fd, const std::vector<std::string> &cmd) {
+    return resp_send_cmd(fd, cmd);
 }
 
-static int write_full(SOCKET fd, const char *buf, size_t n) {
-    while (n > 0) {
-        int rv = send(fd, buf, (int)n, 0);
-        if (rv <= 0) return -1;
-        buf += rv;
-        n -= (size_t)rv;
-    }
-    return 0;
-}
-
-static int send_request(SOCKET fd, const std::vector<std::string> &cmd) {
-    uint32_t len = 4;
-    for (const std::string &s : cmd) {
-        len += 4 + (uint32_t)s.size();
-    }
-    char header[4];
-    memcpy(header, &len, 4);
-    if (write_full(fd, header, 4) != 0) return -1;
-
-    uint32_t nstr = (uint32_t)cmd.size();
-    if (write_full(fd, (char*)&nstr, 4) != 0) return -1;
-
-    for (const std::string &s : cmd) {
-        uint32_t slen = (uint32_t)s.size();
-        if (write_full(fd, (char*)&slen, 4) != 0) return -1;
-        if (write_full(fd, s.data(), slen) != 0) return -1;
-    }
-    return 0;
-}
-
-static int read_response_raw(SOCKET fd, std::vector<uint8_t> &out) {
-    char header[4];
-    if (read_full(fd, header, 4) != 0) return -1;
-
-    uint32_t len = 0;
-    memcpy(&len, header, 4);
-    if (len > k_max_msg) return -1;
-
-    out.resize(len);
-    if (len > 0) {
-        if (read_full(fd, (char*)out.data(), len) != 0) return -1;
-    }
-    return 0;
+static inline int read_response_raw(SOCKET fd, RespValue &out) {
+    return resp_read_val(fd, out);
 }
 
 static SOCKET connect_client() {
@@ -135,7 +83,7 @@ struct ProbeThreadData {
 static unsigned __stdcall probe_worker(void *arg) {
     ProbeThreadData *data = (ProbeThreadData *)arg;
     std::vector<std::string> ping_cmd = {"ping"};
-    std::vector<uint8_t> resp;
+    RespValue resp;
 
     data->max_latency_ms = 0.0;
     data->latencies_ms.reserve(50000);
@@ -177,7 +125,7 @@ static BenchmarkResult run_test_pass(SOCKET client_a, SOCKET client_b, bool enab
     res.num_items = num_items;
 
     // 1. Set lazyfree mode on server
-    std::vector<uint8_t> resp;
+    RespValue resp;
     send_request(client_a, {"config", "set", "lazyfree", enable_lazyfree ? "1" : "0"});
     read_response_raw(client_a, resp);
 
@@ -258,7 +206,7 @@ int main(int argc, char *argv[]) {
     SOCKET client_b = connect_client();
 
     // Warm up connections with a simple PING
-    std::vector<uint8_t> resp;
+    RespValue resp;
     send_request(client_a, {"ping"});
     read_response_raw(client_a, resp);
     send_request(client_b, {"ping"});

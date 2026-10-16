@@ -15,7 +15,7 @@
 #include <string>
 #include <chrono>
 #include <thread>
-#include "../src/serialization.h"
+#include "../src/resp.h"
 
 #define CHECK(cond, msg) \
     do { \
@@ -25,58 +25,12 @@
         } \
     } while (0)
 
-static int write_full(SOCKET fd, const char *buf, size_t n) {
-    while (n > 0) {
-        int rv = send(fd, buf, (int)n, 0);
-        if (rv <= 0) return -1;
-        buf += rv;
-        n -= (size_t)rv;
-    }
-    return 0;
-}
-
-static int read_full(SOCKET fd, char *buf, size_t n) {
-    while (n > 0) {
-        int rv = recv(fd, buf, (int)n, 0);
-        if (rv <= 0) return -1;
-        buf += rv;
-        n -= (size_t)rv;
-    }
-    return 0;
-}
-
 static int send_request(SOCKET fd, const std::vector<std::string> &cmd) {
-    uint32_t len = 4;
-    for (const std::string &s : cmd) {
-        len += 4 + (uint32_t)s.size();
-    }
-    char header[4];
-    memcpy(header, &len, 4);
-    if (write_full(fd, header, 4) != 0) return -1;
-
-    uint32_t nstr = (uint32_t)cmd.size();
-    char nstr_buf[4];
-    memcpy(nstr_buf, &nstr, 4);
-    if (write_full(fd, nstr_buf, 4) != 0) return -1;
-
-    for (const std::string &s : cmd) {
-        uint32_t slen = (uint32_t)s.size();
-        char slen_buf[4];
-        memcpy(slen_buf, &slen, 4);
-        if (write_full(fd, slen_buf, 4) != 0) return -1;
-        if (write_full(fd, s.data(), s.size()) != 0) return -1;
-    }
-    return 0;
+    return resp_send_cmd(fd, cmd);
 }
 
-static int read_response(SOCKET fd, std::vector<uint8_t> &out) {
-    char header[4];
-    if (read_full(fd, header, 4) != 0) return -1;
-    uint32_t len = 0;
-    memcpy(&len, header, 4);
-    out.resize(len);
-    if (read_full(fd, (char *)out.data(), len) != 0) return -1;
-    return 0;
+static int read_response(SOCKET fd, RespValue &out) {
+    return resp_read_val(fd, out);
 }
 
 static SOCKET connect_client() {
@@ -112,7 +66,7 @@ int main() {
 
     // Send initial request on active client
     CHECK(send_request(active_fd, {"set", "timer_test", "hello"}) == 0, "Active client SET failed");
-    std::vector<uint8_t> resp;
+    RespValue resp;
     CHECK(read_response(active_fd, resp) == 0, "Active client read response failed");
     printf("Conn 2: initial SET ok.\n");
 
