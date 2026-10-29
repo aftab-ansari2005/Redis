@@ -63,8 +63,8 @@ test_thread_pool.exe: $(TESTDIR)/test_thread_pool.cpp $(SRCDIR)/thread_pool.h th
 test_lazyfree.exe: $(TESTDIR)/test_lazyfree.cpp $(SRCDIR)/resp.h
 	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_lazyfree.cpp $(LDFLAGS)
 
-test_aof.exe: $(TESTDIR)/test_aof.cpp $(SRCDIR)/resp.h $(SRCDIR)/aof.h
-	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_aof.cpp $(LDFLAGS)
+test_aof.exe: $(TESTDIR)/test_aof.cpp $(SRCDIR)/resp.h $(SRCDIR)/aof.h thread_pool.o
+	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_aof.cpp thread_pool.o $(LDFLAGS)
 
 clean:
 	-del /Q *.exe *.o 2>NUL

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include "resp.h"
+#include "thread_pool.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -36,6 +37,12 @@ struct AofState {
     std::string filename;
     AofFsyncMode fsync_mode = AOF_FSYNC_ALWAYS;
     bool loading = false;
+
+    // AOF Rewrite state (compaction)
+    bool rewrite_in_progress = false;
+    volatile bool rewrite_worker_done = false;
+    std::string rewrite_temp_filename;
+    std::string rewrite_buf; // buffer for writes arriving while background rewrite is active
 };
 
 // Defined in server.cpp (or test file)
@@ -55,6 +62,15 @@ static inline void aof_fsync_file(FILE *fp) {
     }
 #else
     fsync(fileno(fp));
+#endif
+}
+
+// Cross-platform atomic file rename (replaces existing destination)
+static inline bool aof_atomic_rename(const char *old_path, const char *new_path) {
+#ifdef _WIN32
+    return MoveFileExA(old_path, new_path, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    return rename(old_path, new_path) == 0;
 #endif
 }
 
@@ -115,6 +131,11 @@ static inline void aof_append(const std::vector<std::string> &cmd) {
         resp_out_bulk(buf, arg);
     }
 
+    // If a background rewrite is in progress, buffer this mutating write!
+    if (g_aof.rewrite_in_progress) {
+        g_aof.rewrite_buf.append(buf);
+    }
+
     size_t written = fwrite(buf.data(), 1, buf.size(), g_aof.fp);
     if (written != buf.size()) {
         fprintf(stderr, "[aof] Warning: partial write to AOF file\n");
@@ -123,6 +144,110 @@ static inline void aof_append(const std::vector<std::string> &cmd) {
     if (g_aof.fsync_mode == AOF_FSYNC_ALWAYS) {
         aof_fsync_file(g_aof.fp);
     }
+}
+
+// --------------------------------------------------------------------------
+// Background AOF Rewrite (Compaction)
+// --------------------------------------------------------------------------
+struct AofRewriteTask {
+    std::string temp_filename;
+    std::string snapshot_data;
+};
+
+static inline void aof_rewrite_worker(void *arg) {
+    AofRewriteTask *task = (AofRewriteTask *)arg;
+
+    FILE *fp = fopen(task->temp_filename.c_str(), "wb");
+    if (fp) {
+        if (!task->snapshot_data.empty()) {
+            fwrite(task->snapshot_data.data(), 1, task->snapshot_data.size(), fp);
+        }
+        aof_fsync_file(fp);
+        fclose(fp);
+    } else {
+        fprintf(stderr, "[aof] Failed to open temp rewrite file '%s'\n", task->temp_filename.c_str());
+    }
+
+    delete task;
+    g_aof.rewrite_worker_done = true;
+}
+
+// Start background AOF rewrite using ThreadPool
+static inline bool aof_start_bgrewrite(ThreadPool *tp, std::string &snapshot_data, const std::string &temp_filename) {
+    if (g_aof.rewrite_in_progress) {
+        return false;
+    }
+
+    g_aof.rewrite_in_progress = true;
+    g_aof.rewrite_worker_done = false;
+    g_aof.rewrite_temp_filename = temp_filename;
+    g_aof.rewrite_buf.clear();
+
+    AofRewriteTask *task = new AofRewriteTask();
+    task->temp_filename = temp_filename;
+    task->snapshot_data = std::move(snapshot_data);
+
+    thread_pool_queue(tp, &aof_rewrite_worker, task);
+    return true;
+}
+
+// Synchronous AOF rewrite
+static inline bool aof_rewrite_sync(const std::string &snapshot_data, const std::string &temp_filename) {
+    if (g_aof.rewrite_in_progress) {
+        return false;
+    }
+
+    FILE *fp = fopen(temp_filename.c_str(), "wb");
+    if (!fp) return false;
+
+    if (!snapshot_data.empty()) {
+        fwrite(snapshot_data.data(), 1, snapshot_data.size(), fp);
+    }
+    aof_fsync_file(fp);
+    fclose(fp);
+
+    aof_close();
+    if (!aof_atomic_rename(temp_filename.c_str(), g_aof.filename.c_str())) {
+        fprintf(stderr, "[aof] Error: rename failed during synchronous rewrite\n");
+    }
+    aof_init(g_aof.filename, g_aof.fsync_mode);
+    return true;
+}
+
+// Called from event loop to check if the worker finished writing the snapshot
+static inline bool aof_check_rewrite_done() {
+    if (!g_aof.rewrite_in_progress || !g_aof.rewrite_worker_done) {
+        return false;
+    }
+
+    // 1. Append commands that arrived in the rewrite buffer while the worker was writing
+    if (!g_aof.rewrite_buf.empty()) {
+        FILE *fp = fopen(g_aof.rewrite_temp_filename.c_str(), "ab");
+        if (fp) {
+            fwrite(g_aof.rewrite_buf.data(), 1, g_aof.rewrite_buf.size(), fp);
+            aof_fsync_file(fp);
+            fclose(fp);
+        }
+        g_aof.rewrite_buf.clear();
+    }
+
+    // 2. Close active AOF handle
+    aof_close();
+
+    // 3. Atomically replace old AOF with newly compacted file
+    if (!aof_atomic_rename(g_aof.rewrite_temp_filename.c_str(), g_aof.filename.c_str())) {
+        fprintf(stderr, "[aof] Error: atomic rename '%s' -> '%s' failed!\n",
+                g_aof.rewrite_temp_filename.c_str(), g_aof.filename.c_str());
+    }
+
+    // 4. Reopen compacted AOF in append mode
+    aof_init(g_aof.filename, g_aof.fsync_mode);
+
+    g_aof.rewrite_in_progress = false;
+    g_aof.rewrite_worker_done = false;
+
+    printf("[aof] Background AOF rewrite completed successfully.\n");
+    return true;
 }
 
 // Replay AOF on startup:

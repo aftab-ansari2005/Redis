@@ -1,4 +1,7 @@
 // test_aof.cpp — Comprehensive tests for Append-Only File (AOF) persistence
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
 #define WIN32_LEAN_AND_MEAN
 #ifndef __USE_MINGW_ANSI_STDIO
 #define __USE_MINGW_ANSI_STDIO 1
@@ -258,6 +261,139 @@ static void test_aof_server_integration() {
     remove(aof_file.c_str());
 }
 
+// --------------------------------------------------------------------------
+// Part 3: BGREWRITEAOF Compaction & Concurrent Write Buffer Test
+// --------------------------------------------------------------------------
+static void test_aof_rewrite() {
+    printf("\n=== Test 3: BGREWRITEAOF Compaction & Concurrent Writes ===\n");
+    const std::string aof_file = "test_compaction.aof";
+    const int test_port = 12349;
+    remove(aof_file.c_str());
+
+    PROCESS_INFORMATION srv = start_server(aof_file, test_port);
+    SOCKET client = connect_client(test_port);
+    RespValue rv;
+
+    // 1. Generate log bloat: 100 updates to 'counter'
+    for (int i = 0; i < 100; i++) {
+        resp_send_cmd(client, {"SET", "counter", std::to_string(i)});
+        resp_read_val(client, rv);
+    }
+
+    // 2. Add keys that will be deleted
+    resp_send_cmd(client, {"SET", "dead1", "val1"});
+    resp_read_val(client, rv);
+    resp_send_cmd(client, {"SET", "dead2", "val2"});
+    resp_read_val(client, rv);
+    resp_send_cmd(client, {"DEL", "dead1", "dead2"});
+    resp_read_val(client, rv);
+
+    // 3. Add sorted set with updates
+    resp_send_cmd(client, {"ZADD", "myz", "10.0", "player1"});
+    resp_read_val(client, rv);
+    resp_send_cmd(client, {"ZADD", "myz", "20.0", "player2"});
+    resp_read_val(client, rv);
+    resp_send_cmd(client, {"ZADD", "myz", "30.0", "player1"}); // updated score
+    resp_read_val(client, rv);
+
+    // 4. Add key with TTL
+    resp_send_cmd(client, {"SET", "exp_key", "value"});
+    resp_read_val(client, rv);
+    resp_send_cmd(client, {"EXPIRE", "exp_key", "500"});
+    resp_read_val(client, rv);
+
+    // Measure bloated file size
+    FILE *fp = fopen(aof_file.c_str(), "rb");
+    fseek(fp, 0, SEEK_END);
+    long bloated_size = ftell(fp);
+    fclose(fp);
+    printf("Bloated AOF size before compaction: %ld bytes (100+ commands)\n", bloated_size);
+
+    // 5. Trigger BGREWRITEAOF
+    resp_send_cmd(client, {"BGREWRITEAOF"});
+    resp_read_val(client, rv);
+    if (rv.type != RESP_STR || rv.str_val != "Background append only file rewriting started") {
+        die("BGREWRITEAOF failed to start!");
+    }
+
+    // 6. Send concurrent write *while* rewrite is in progress
+    resp_send_cmd(client, {"SET", "concurrent_key", "concurrent_val"});
+    resp_read_val(client, rv);
+    if (rv.type != RESP_STR || rv.str_val != "OK") {
+        die("Write during BGREWRITEAOF failed!");
+    }
+
+    // Give background worker and event loop time to finish and commit rename
+    Sleep(300);
+
+    // Measure compacted file size
+    fp = fopen(aof_file.c_str(), "rb");
+    fseek(fp, 0, SEEK_END);
+    long compacted_size = ftell(fp);
+    fclose(fp);
+    printf("Compacted AOF size after BGREWRITEAOF: %ld bytes\n", compacted_size);
+
+    if (compacted_size >= bloated_size) {
+        die("Compacted file size should be significantly smaller than bloated size!");
+    }
+
+    // 7. Restart server and verify full state reconstruction
+    closesocket(client);
+    stop_server(srv);
+
+    srv = start_server(aof_file, test_port);
+    client = connect_client(test_port);
+
+    // Counter must have latest value (99)
+    resp_send_cmd(client, {"GET", "counter"});
+    resp_read_val(client, rv);
+    if (rv.type != RESP_STR || rv.str_val != "99") {
+        die("Restored counter mismatch!");
+    }
+
+    // Deleted keys must not exist
+    resp_send_cmd(client, {"EXISTS", "dead1"});
+    resp_read_val(client, rv);
+    if (rv.type != RESP_INT || rv.int_val != 0) {
+        die("Deleted key dead1 was resurrected!");
+    }
+
+    // Sorted set must have latest scores
+    resp_send_cmd(client, {"ZSCORE", "myz", "player1"});
+    resp_read_val(client, rv);
+    if (rv.type != RESP_STR || rv.str_val.substr(0, 2) != "30") {
+        die("ZSet player1 score mismatch!");
+    }
+
+    resp_send_cmd(client, {"ZSCORE", "myz", "player2"});
+    resp_read_val(client, rv);
+    if (rv.type != RESP_STR || rv.str_val.substr(0, 2) != "20") {
+        die("ZSet player2 score mismatch!");
+    }
+
+    // TTL must be active
+    resp_send_cmd(client, {"TTL", "exp_key"});
+    resp_read_val(client, rv);
+    if (rv.type != RESP_INT || rv.int_val < 450 || rv.int_val > 500) {
+        die("TTL on compacted key mismatch!");
+    }
+
+    // Concurrent write must be present!
+    resp_send_cmd(client, {"GET", "concurrent_key"});
+    resp_read_val(client, rv);
+    if (rv.type != RESP_STR || rv.str_val != "concurrent_val") {
+        die("Concurrent write during BGREWRITEAOF was lost!");
+    }
+
+    printf("[PASS] BGREWRITEAOF compacted file from %ld to %ld bytes (reduction: %.1f%%).\n",
+           bloated_size, compacted_size, (1.0 - (double)compacted_size / bloated_size) * 100.0);
+    printf("[PASS] Concurrent writes during rewrite preserved with zero loss.\n");
+
+    closesocket(client);
+    stop_server(srv);
+    remove(aof_file.c_str());
+}
+
 int main() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -268,6 +404,7 @@ int main() {
 
     test_aof_unit();
     test_aof_server_integration();
+    test_aof_rewrite();
 
     printf("\n========================================\n");
     printf("ALL AOF TESTS PASSED SUCCESSFULLY!\n");

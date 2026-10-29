@@ -300,7 +300,7 @@ static int next_timer_ms() {
     }
 
     if (next_us == (uint64_t)-1) {
-        return 10000; // default wait when no timers are active
+        return g_aof.rewrite_in_progress ? 50 : 10000;
     }
 
     if (next_us <= now_us) {
@@ -308,7 +308,12 @@ static int next_timer_ms() {
     }
 
     // Convert microsecond delta to millisecond timeout, rounding up
-    return (int)((next_us - now_us + 999) / 1000);
+    int res_ms = (int)((next_us - now_us + 999) / 1000);
+    // If a background AOF rewrite is active, clamp poll timeout to 50ms so we check completion promptly
+    if (g_aof.rewrite_in_progress && res_ms > 50) {
+        res_ms = 50;
+    }
+    return res_ms;
 }
 
 // Timeout sweep: close idle connections and actively reclaim expired keys
@@ -937,6 +942,118 @@ static void do_zpopulate(const std::vector<std::string> &cmd, std::string &out) 
 }
 
 // --------------------------------------------------------------------------
+// AOF Compaction / Snapshot Generation
+// --------------------------------------------------------------------------
+static std::string aof_generate_snapshot_data() {
+    uint64_t now_us = get_monotonic_usec();
+    uint64_t now_wall_ms = get_wall_clock_ms();
+    std::string out;
+
+    auto dump_entry = [&](Entry *ent) {
+        // Skip expired keys
+        if (ent->heap_idx != (size_t)-1 && g_heap[ent->heap_idx].val <= now_us) {
+            return;
+        }
+
+        // 1. Recreate value (String or ZSet)
+        if (ent->type == T_STR) {
+            std::vector<std::string> set_cmd = {"SET", ent->key, ent->val};
+            resp_out_arr_header(out, set_cmd.size());
+            for (const auto &arg : set_cmd) {
+                resp_out_bulk(out, arg);
+            }
+        } else if (ent->type == T_ZSET && ent->zset) {
+            auto dump_zset_tab = [&](HTab *tab) {
+                if (!tab || !tab->tab) return;
+                for (size_t i = 0; i <= tab->mask; i++) {
+                    HNode *node = tab->tab[i];
+                    while (node) {
+                        ZNode *zn = container_of(node, ZNode, hmap);
+                        node = node->next;
+                        char sbuf[64];
+                        snprintf(sbuf, sizeof(sbuf), "%.17g", zn->score);
+                        std::vector<std::string> zadd_cmd = {"ZADD", ent->key, sbuf, zn->name};
+                        resp_out_arr_header(out, zadd_cmd.size());
+                        for (const auto &arg : zadd_cmd) {
+                            resp_out_bulk(out, arg);
+                        }
+                    }
+                }
+            };
+            dump_zset_tab(&ent->zset->hmap.ht1);
+            dump_zset_tab(&ent->zset->hmap.ht2);
+        }
+
+        // 2. Recreate TTL if key has unexpired TTL
+        if (ent->heap_idx != (size_t)-1) {
+            uint64_t expire_us = g_heap[ent->heap_idx].val;
+            if (expire_us > now_us) {
+                uint64_t remain_ms = (expire_us - now_us) / 1000ULL;
+                uint64_t expire_at_ms = now_wall_ms + remain_ms;
+                std::vector<std::string> exp_cmd = {"PEXPIREAT", ent->key, std::to_string(expire_at_ms)};
+                resp_out_arr_header(out, exp_cmd.size());
+                for (const auto &arg : exp_cmd) {
+                    resp_out_bulk(out, arg);
+                }
+            }
+        }
+    };
+
+    auto scan_tab = [&](HTab *tab) {
+        if (!tab || !tab->tab) return;
+        for (size_t i = 0; i <= tab->mask; i++) {
+            HNode *node = tab->tab[i];
+            while (node) {
+                Entry *ent = container_of(node, Entry, node);
+                node = node->next;
+                dump_entry(ent);
+            }
+        }
+    };
+
+    scan_tab(&g_map.ht1);
+    scan_tab(&g_map.ht2);
+
+    return out;
+}
+
+static void do_bgrewriteaof(const std::vector<std::string> &cmd, std::string &out) {
+    (void)cmd;
+    if (g_aof.rewrite_in_progress) {
+        resp_out_err(out, "ERR Background append only file rewriting already in progress");
+        return;
+    }
+
+    std::string snapshot = aof_generate_snapshot_data();
+    std::string temp_file = "temp-" + g_aof.filename;
+
+    if (!aof_start_bgrewrite(&g_tp, snapshot, temp_file)) {
+        resp_out_err(out, "ERR failed to start background AOF rewrite");
+        return;
+    }
+
+    resp_out_str(out, "Background append only file rewriting started");
+}
+
+static void do_rewriteaof(const std::vector<std::string> &cmd, std::string &out) {
+    (void)cmd;
+    if (g_aof.rewrite_in_progress) {
+        resp_out_err(out, "ERR Background append only file rewriting already in progress");
+        return;
+    }
+
+    std::string snapshot = aof_generate_snapshot_data();
+    std::string temp_file = "temp-" + g_aof.filename;
+
+    if (!aof_rewrite_sync(snapshot, temp_file)) {
+        resp_out_err(out, "ERR synchronous AOF rewrite failed");
+        return;
+    }
+
+    resp_out_str(out, "OK");
+}
+
+// --------------------------------------------------------------------------
 // Command dispatch — the central router.
 // --------------------------------------------------------------------------
 static void do_request(const std::vector<std::string> &cmd, std::string &out, bool &want_close) {
@@ -998,6 +1115,10 @@ static void do_request(const std::vector<std::string> &cmd, std::string &out, bo
         do_zrank(cmd, out);
     } else if (c == "ZQUERY") {
         do_zquery(cmd, out);
+    } else if (c == "BGREWRITEAOF") {
+        do_bgrewriteaof(cmd, out);
+    } else if (c == "REWRITEAOF") {
+        do_rewriteaof(cmd, out);
     } else {
         resp_out_err(out, "ERR unknown command '" + cmd[0] + "'");
     }
@@ -1279,6 +1400,9 @@ int main(int argc, char **argv) {
 
         // ---- Step 5: Process timers (timeout sweep) ----
         process_timers();
+
+        // ---- Check background AOF rewrite completion ----
+        aof_check_rewrite_done();
 
         // ---- Step 6: Sweep closed connections ----
         for (int i = (int)connections.size() - 1; i >= 0; i--) {

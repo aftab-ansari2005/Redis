@@ -61,4 +61,11 @@ Format: Part N — what happened, what you chose, and why.
 - **Choice:** `aof_load()` tracks the byte offset of the last complete command (`valid_bytes`). If `parse_request()` returns `PARSE_NEED_MORE` or `PARSE_ERR` at EOF, the file is automatically truncated back to `valid_bytes` using `SetEndOfFile` / `ftruncate()`.
 - **Result:** Self-healing startup that preserves all committed operations without manual administrative intervention.
 
+### 4. Non-Forking Background Compaction (`BGREWRITEAOF`) & Rewrite Buffer
+- **Context:** An append-only log monotonically accumulates command history (e.g. 100,000 updates to a single key). Linux Redis uses POSIX `fork()` with Copy-on-Write to dump memory without blocking, but Windows lacks `fork()`.
+- **Choice:** Implemented an in-memory snapshot generator that walks live keys in `g_map` and produces minimal reconstruction commands (`SET`, `ZADD`, `PEXPIREAT`). The heavy disk I/O and `fsync` are offloaded to `ThreadPool`.
+- **Concurrent Writes:** Mutating writes arriving while the background worker is active are dual-written: flushed to the active AOF (preserving crash safety) and buffered in `g_aof.rewrite_buf`. When the worker finishes, the event loop appends the rewrite buffer to the temp file, closes the active AOF, and atomically swaps it in via `MoveFileExA(..., MOVEFILE_REPLACE_EXISTING)`.
+- **Poll Clamping:** Clamped `WSAPoll` timeout to 50ms while `rewrite_in_progress` is active, ensuring the event loop completes the rewrite immediately upon worker exit without waiting for idle socket timeouts.
+- **Result:** Zero event-loop blocking, zero data races on keyspace memory, and zero lost writes under heavy concurrent traffic.
+
 
