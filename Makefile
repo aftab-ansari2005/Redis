@@ -4,7 +4,7 @@ LDFLAGS = -lws2_32
 SRCDIR = src
 TESTDIR = tests
 
-all: server.exe client.exe test_oversized.exe test_concurrent.exe test_commands.exe test_hashtable.exe test_avl.exe test_zset.exe test_dlist.exe test_timers.exe test_heap.exe test_ttl.exe test_thread_pool.exe test_lazyfree.exe test_aof.exe
+all: server.exe client.exe test_oversized.exe test_concurrent.exe test_commands.exe test_hashtable.exe test_avl.exe test_zset.exe test_dlist.exe test_timers.exe test_heap.exe test_ttl.exe test_thread_pool.exe test_lazyfree.exe test_aof.exe test_transactions.exe
 
 hashtable.o: $(SRCDIR)/hashtable.cpp $(SRCDIR)/hashtable.h
 	$(CXX) $(CXXFLAGS) -c -o $@ $(SRCDIR)/hashtable.cpp
@@ -65,6 +65,9 @@ test_lazyfree.exe: $(TESTDIR)/test_lazyfree.cpp $(SRCDIR)/resp.h
 
 test_aof.exe: $(TESTDIR)/test_aof.cpp $(SRCDIR)/resp.h $(SRCDIR)/aof.h thread_pool.o
 	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_aof.cpp thread_pool.o $(LDFLAGS)
+
+test_transactions.exe: $(TESTDIR)/test_transactions.cpp $(SRCDIR)/resp.h
+	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_transactions.cpp $(LDFLAGS)
 
 clean:
 	-del /Q *.exe *.o 2>NUL

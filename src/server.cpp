@@ -240,6 +240,13 @@ enum {
     STATE_WRITE = 1,
 };
 
+struct QueuedCmd {
+    std::vector<std::string> argv;
+};
+
+static const size_t k_max_tx_commands = 10000;
+static const size_t k_max_tx_bytes    = 16 * 1024 * 1024; // 16 MB
+
 // --------------------------------------------------------------------------
 // Conn — per-connection state.
 // --------------------------------------------------------------------------
@@ -258,6 +265,12 @@ struct Conn {
     // Idle timer tracking
     uint64_t idle_start = 0;       // timestamp in microseconds of last IO activity
     DList    idle_list = {};       // intrusive doubly-linked list node in g_idle_list
+
+    // Transaction state (MULTI / EXEC / DISCARD)
+    bool in_multi = false;
+    bool tx_abort = false;
+    std::vector<QueuedCmd> tx_queue;
+    size_t tx_queued_bytes = 0;
 };
 
 // --------------------------------------------------------------------------
@@ -1053,16 +1066,285 @@ static void do_rewriteaof(const std::vector<std::string> &cmd, std::string &out)
     resp_out_str(out, "OK");
 }
 
+// Forward declaration for recursive execution in EXEC
+static void do_request(Conn *conn, const std::vector<std::string> &cmd, std::string &out, bool &want_close);
+
+// Syntax & arity validation for queue-time error detection (EXECABORT)
+static bool validate_cmd_syntax(const std::vector<std::string> &cmd, std::string &err_msg) {
+    if (cmd.empty()) {
+        err_msg = "ERR unknown command ''";
+        return false;
+    }
+
+    std::string c = cmd[0];
+    for (char &ch : c) ch = (char)toupper((unsigned char)ch);
+
+    if (c == "PING") {
+        if (cmd.size() > 2) {
+            err_msg = "ERR wrong number of arguments for 'ping' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "ECHO") {
+        if (cmd.size() != 2) {
+            err_msg = "ERR wrong number of arguments for 'echo' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "GET") {
+        if (cmd.size() != 2) {
+            err_msg = "ERR wrong number of arguments for 'get' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "SET") {
+        if (cmd.size() != 3) {
+            err_msg = "ERR wrong number of arguments for 'set' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "DEL" || c == "UNLINK") {
+        if (cmd.size() < 2) {
+            err_msg = "ERR wrong number of arguments for 'del' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "EXISTS") {
+        if (cmd.size() < 2) {
+            err_msg = "ERR wrong number of arguments for 'exists' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "KEYS") {
+        return true;
+    }
+    if (c == "EXPIRE") {
+        if (cmd.size() != 3) {
+            err_msg = "ERR wrong number of arguments for 'expire' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "PEXPIRE") {
+        if (cmd.size() != 3) {
+            err_msg = "ERR wrong number of arguments for 'pexpire' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "PEXPIREAT") {
+        if (cmd.size() != 3) {
+            err_msg = "ERR wrong number of arguments for 'pexpireat' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "TTL") {
+        if (cmd.size() != 2) {
+            err_msg = "ERR wrong number of arguments for 'ttl' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "PTTL") {
+        if (cmd.size() != 2) {
+            err_msg = "ERR wrong number of arguments for 'pttl' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "PERSIST") {
+        if (cmd.size() != 2) {
+            err_msg = "ERR wrong number of arguments for 'persist' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "ZADD") {
+        if (cmd.size() != 4) {
+            err_msg = "ERR wrong number of arguments for 'zadd' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "ZSCORE") {
+        if (cmd.size() != 3) {
+            err_msg = "ERR wrong number of arguments for 'zscore' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "ZREM") {
+        if (cmd.size() != 3) {
+            err_msg = "ERR wrong number of arguments for 'zrem' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "ZRANK") {
+        if (cmd.size() != 3) {
+            err_msg = "ERR wrong number of arguments for 'zrank' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "ZQUERY") {
+        if (cmd.size() != 6) {
+            err_msg = "ERR wrong number of arguments for 'zquery' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "ZPOPULATE") {
+        if (cmd.size() != 3) {
+            err_msg = "ERR wrong number of arguments for 'zpopulate' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "CONFIG" || c == "CLIENT" || c == "COMMAND" || c == "HELLO" || c == "QUIT" || c == "BGREWRITEAOF" || c == "REWRITEAOF") {
+        return true;
+    }
+
+    err_msg = "ERR unknown command '" + cmd[0] + "'";
+    return false;
+}
+
+static void do_exec(Conn *conn, std::string &out) {
+    if (!conn->in_multi) {
+        resp_out_err(out, "ERR EXEC without MULTI");
+        return;
+    }
+
+    if (conn->tx_abort) {
+        conn->in_multi = false;
+        conn->tx_abort = false;
+        conn->tx_queue.clear();
+        conn->tx_queued_bytes = 0;
+        resp_out_err(out, "EXECABORT Transaction discarded because of previous errors.");
+        return;
+    }
+
+    if (conn->tx_queue.empty()) {
+        conn->in_multi = false;
+        conn->tx_abort = false;
+        resp_out_arr_header(out, 0); // *0\r\n
+        return;
+    }
+
+    // Move out queue and exit multi mode before executing
+    std::vector<QueuedCmd> queue = std::move(conn->tx_queue);
+    conn->in_multi = false;
+    conn->tx_abort = false;
+    conn->tx_queued_bytes = 0;
+
+    // Begin AOF transaction buffering
+    aof_tx_begin();
+
+    std::vector<std::string> results;
+    results.reserve(queue.size());
+
+    for (const auto &qcmd : queue) {
+        std::string cmd_out;
+        bool dummy_close = false;
+        do_request(NULL, qcmd.argv, cmd_out, dummy_close);
+        results.push_back(cmd_out);
+    }
+
+    // Commit atomic transaction block to AOF
+    aof_tx_commit();
+
+    // Assemble array of results: *<count>\r\n<r1><r2>...
+    resp_out_arr_header(out, results.size());
+    for (const auto &res : results) {
+        out.append(res);
+    }
+}
+
 // --------------------------------------------------------------------------
 // Command dispatch — the central router.
 // --------------------------------------------------------------------------
-static void do_request(const std::vector<std::string> &cmd, std::string &out, bool &want_close) {
+static void do_request(Conn *conn, const std::vector<std::string> &cmd, std::string &out, bool &want_close) {
     if (cmd.empty()) {
         return;
     }
 
     std::string c = cmd[0];
     for (char &ch : c) ch = (char)toupper((unsigned char)ch);
+
+    // ----------------------------------------------------------------------
+    // Transaction Mode: Queuing
+    // ----------------------------------------------------------------------
+    if (conn && conn->in_multi) {
+        if (c == "MULTI") {
+            resp_out_err(out, "ERR MULTI calls can not be nested");
+            return;
+        }
+        if (c == "DISCARD") {
+            conn->in_multi = false;
+            conn->tx_abort = false;
+            conn->tx_queue.clear();
+            conn->tx_queued_bytes = 0;
+            resp_out_str(out, "OK");
+            return;
+        }
+        if (c == "EXEC") {
+            do_exec(conn, out);
+            return;
+        }
+        if (c == "QUIT") {
+            resp_out_str(out, "OK");
+            want_close = true;
+            return;
+        }
+
+        // Validate syntax at queue time
+        std::string err_msg;
+        if (!validate_cmd_syntax(cmd, err_msg)) {
+            conn->tx_abort = true;
+            resp_out_err(out, err_msg);
+            return;
+        }
+
+        size_t cmd_bytes = 0;
+        for (const auto &s : cmd) cmd_bytes += s.size() + sizeof(std::string);
+        if (conn->tx_queue.size() >= k_max_tx_commands || conn->tx_queued_bytes + cmd_bytes > k_max_tx_bytes) {
+            conn->tx_abort = true;
+            resp_out_err(out, "ERR transaction queue limit exceeded");
+            return;
+        }
+
+        conn->tx_queue.push_back({cmd});
+        conn->tx_queued_bytes += cmd_bytes;
+        resp_out_str(out, "QUEUED");
+        return;
+    }
+
+    // Top-level MULTI / EXEC / DISCARD
+    if (c == "MULTI") {
+        if (conn) {
+            conn->in_multi = true;
+            conn->tx_abort = false;
+            conn->tx_queue.clear();
+            conn->tx_queued_bytes = 0;
+        }
+        resp_out_str(out, "OK");
+        return;
+    }
+    if (c == "EXEC") {
+        resp_out_err(out, "ERR EXEC without MULTI");
+        return;
+    }
+    if (c == "DISCARD") {
+        resp_out_err(out, "ERR DISCARD without MULTI");
+        return;
+    }
 
     if (c == "PING") {
         do_ping(cmd, out);
@@ -1148,7 +1430,7 @@ static void process_rbuf(Conn *conn) {
         }
         rbuf_idx += consumed;
         if (!cmd.empty()) {
-            do_request(cmd, conn->wbuf, conn->want_close);
+            do_request(conn, cmd, conn->wbuf, conn->want_close);
             if (conn->want_close) break;
         }
     }
@@ -1326,7 +1608,7 @@ int main(int argc, char **argv) {
     aof_load(aof_filename, [](const std::vector<std::string> &cmd) {
         std::string dummy_out;
         bool dummy_close = false;
-        do_request(cmd, dummy_out, dummy_close);
+        do_request(NULL, cmd, dummy_out, dummy_close);
     });
 
     // Open AOF in append mode

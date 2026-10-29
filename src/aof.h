@@ -43,6 +43,10 @@ struct AofState {
     volatile bool rewrite_worker_done = false;
     std::string rewrite_temp_filename;
     std::string rewrite_buf; // buffer for writes arriving while background rewrite is active
+
+    // Transaction state
+    bool tx_active = false;
+    std::string tx_buf; // buffer for mutating commands during an EXEC transaction block
 };
 
 // Defined in server.cpp (or test file)
@@ -131,6 +135,12 @@ static inline void aof_append(const std::vector<std::string> &cmd) {
         resp_out_bulk(buf, arg);
     }
 
+    // If an EXEC transaction block is currently active, buffer this command into tx_buf!
+    if (g_aof.tx_active) {
+        g_aof.tx_buf.append(buf);
+        return;
+    }
+
     // If a background rewrite is in progress, buffer this mutating write!
     if (g_aof.rewrite_in_progress) {
         g_aof.rewrite_buf.append(buf);
@@ -139,6 +149,50 @@ static inline void aof_append(const std::vector<std::string> &cmd) {
     size_t written = fwrite(buf.data(), 1, buf.size(), g_aof.fp);
     if (written != buf.size()) {
         fprintf(stderr, "[aof] Warning: partial write to AOF file\n");
+    }
+
+    if (g_aof.fsync_mode == AOF_FSYNC_ALWAYS) {
+        aof_fsync_file(g_aof.fp);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Transaction Logging Helpers (Atomic MULTI ... EXEC block in AOF)
+// --------------------------------------------------------------------------
+static inline void aof_tx_begin() {
+    g_aof.tx_active = true;
+    g_aof.tx_buf.clear();
+}
+
+static inline void aof_tx_commit() {
+    if (!g_aof.tx_active) return;
+    g_aof.tx_active = false;
+
+    if (g_aof.tx_buf.empty() || !g_aof.fp) {
+        return;
+    }
+
+    std::string block;
+    // *1\r\n$5\r\nMULTI\r\n
+    resp_out_arr_header(block, 1);
+    resp_out_bulk(block, "MULTI");
+
+    // All mutating operations executed in this transaction
+    block.append(g_aof.tx_buf);
+
+    // *1\r\n$4\r\nEXEC\r\n
+    resp_out_arr_header(block, 1);
+    resp_out_bulk(block, "EXEC");
+
+    g_aof.tx_buf.clear();
+
+    if (g_aof.rewrite_in_progress) {
+        g_aof.rewrite_buf.append(block);
+    }
+
+    size_t written = fwrite(block.data(), 1, block.size(), g_aof.fp);
+    if (written != block.size()) {
+        fprintf(stderr, "[aof] Warning: partial write of transaction block\n");
     }
 
     if (g_aof.fsync_mode == AOF_FSYNC_ALWAYS) {
@@ -285,20 +339,59 @@ static inline bool aof_load(const std::string &filename, Dispatcher dispatch_fn)
     size_t replayed_count = 0;
     bool truncated_tail = false;
 
+    bool in_aof_multi = false;
+    size_t multi_start_offset = 0;
+    std::vector<std::vector<std::string>> aof_multi_cmds;
+
     while (offset < bytes_read) {
         size_t consumed = 0;
         std::vector<std::string> cmd;
         ParseStatus st = parse_request(buf.data() + offset, bytes_read - offset, consumed, cmd);
 
         if (st == PARSE_OK) {
-            dispatch_fn(cmd);
+            std::string c = cmd.empty() ? "" : cmd[0];
+            for (char &ch : c) ch = (char)toupper((unsigned char)ch);
+
+            if (c == "MULTI") {
+                in_aof_multi = true;
+                multi_start_offset = offset;
+                aof_multi_cmds.clear();
+            } else if (c == "EXEC") {
+                if (in_aof_multi) {
+                    for (const auto &tcmd : aof_multi_cmds) {
+                        dispatch_fn(tcmd);
+                        replayed_count++;
+                    }
+                    in_aof_multi = false;
+                    aof_multi_cmds.clear();
+                    offset += consumed;
+                    valid_bytes = offset;
+                    continue;
+                }
+            } else if (in_aof_multi) {
+                aof_multi_cmds.push_back(cmd);
+            } else {
+                dispatch_fn(cmd);
+                replayed_count++;
+            }
+
             offset += consumed;
-            valid_bytes = offset;
-            replayed_count++;
+            if (!in_aof_multi) {
+                valid_bytes = offset;
+            }
         } else if (st == PARSE_NEED_MORE || st == PARSE_ERR) {
             truncated_tail = true;
             break;
         }
+    }
+
+    // If EOF was reached while an open MULTI block was not terminated with EXEC,
+    // the transaction was never committed! Roll back and truncate to multi_start_offset.
+    if (in_aof_multi) {
+        truncated_tail = true;
+        valid_bytes = multi_start_offset;
+        fprintf(stderr, "[aof] Warning: incomplete MULTI transaction block at end of '%s'. Rolling back and truncating.\n",
+                filename.c_str());
     }
 
     g_aof.loading = false;

@@ -68,4 +68,20 @@ Format: Part N — what happened, what you chose, and why.
 - **Poll Clamping:** Clamped `WSAPoll` timeout to 50ms while `rewrite_in_progress` is active, ensuring the event loop completes the rewrite immediately upon worker exit without waiting for idle socket timeouts.
 - **Result:** Zero event-loop blocking, zero data races on keyspace memory, and zero lost writes under heavy concurrent traffic.
 
+---
+
+## Part 12 (Extension) — `MULTI` / `EXEC` / `DISCARD` Transactions
+
+### 1. Two-Phase Command Validation: Queue-Time (`EXECABORT`) vs. Runtime Errors
+- **Context:** Applications can issue malformed syntax, wrong argument counts, or non-existent commands. If errors are only detected at execution time, partial or corrupt commands could pollute state.
+- **Choice:** Added `validate_cmd_syntax()` at queue time. If any syntax error occurs, the connection is flagged with `tx_abort = true`. When `EXEC` is invoked, the entire transaction is rejected with `-EXECABORT Transaction discarded because of previous errors.`.
+- **Runtime Errors:** Type errors (e.g. `WRONGTYPE`) only surface during execution against memory. In accordance with Redis semantics, runtime errors populate their respective slot in the `EXEC` reply array, and subsequent commands still execute without rollback.
+- **Result:** Strict protection against syntax errors; clean Redis-compatible error semantics.
+
+### 2. Transactional Durability via Contiguous AOF Blocks
+- **Context:** Logging commands individually during `EXEC` could leave half an executed transaction in the AOF if power is cut midway through the block.
+- **Choice:** Mutating commands executed inside `do_exec()` are buffered in `g_aof.tx_buf`. Once execution finishes, the entire block is emitted as `MULTI\r\n...mutations...\r\nEXEC\r\n` in a single contiguous write and `fsync()`.
+- **Crash Recovery:** If an incomplete `MULTI` block is detected at EOF during `aof_load()`, the recovery engine discards all uncommitted commands and truncates the file back to the offset preceding `MULTI`.
+- **Result:** Complete all-or-nothing transactional durability across restarts and crashes.
+
 
