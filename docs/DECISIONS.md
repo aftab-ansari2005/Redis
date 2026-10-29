@@ -42,4 +42,23 @@ Format: Part N — what happened, what you chose, and why.
 - **Choice:** Implemented `ThreadPool` with conditional compilation supporting native Windows synchronization (`CRITICAL_SECTION`, `CONDITION_VARIABLE`, `_beginthreadex`) as well as standard POSIX (`pthread_mutex_t`, `pthread_cond_t`, `pthread_create`).
 - **Result:** Fully portable across Windows (MinGW/MSVC) and Linux/macOS with zero external runtime dependencies.
 
+---
+
+## Part 12 (Extension) — Append-Only File (AOF) Persistence
+
+### 1. Canonical RESP2 Array Wire Format for AOF
+- **Context:** Storing commands in custom binary or plaintext formats causes code duplication, maintenance overhead, and custom parser complexity.
+- **Choice:** Used standard RESP2 arrays (`*<argc>\r\n$<len>\r\n...`) identical to client requests. Replay directly invokes `parse_request()`.
+- **Result:** Zero parser duplication; 100% format alignment with client communication.
+
+### 2. Relative TTL Expiration Translation (`PEXPIREAT`)
+- **Context:** Logging `EXPIRE key 60` causes expiration countdown to restart on server reboot, resurrecting keys that should have died during downtime.
+- **Choice:** Translated all `EXPIRE` and `PEXPIRE` commands to `PEXPIREAT key <unix_timestamp_ms>` before writing to disk. Replay checks `unix_timestamp_ms <= now_ms` and discards expired keys immediately, preventing resurrection.
+- **Result:** Full time-consistency and correct expiration semantics across arbitrary crash/restart intervals.
+
+### 3. Graceful Crash Recovery via Tail Truncation
+- **Context:** Process termination or power failure can interrupt a disk write, leaving an incomplete command at the end of the file.
+- **Choice:** `aof_load()` tracks the byte offset of the last complete command (`valid_bytes`). If `parse_request()` returns `PARSE_NEED_MORE` or `PARSE_ERR` at EOF, the file is automatically truncated back to `valid_bytes` using `SetEndOfFile` / `ftruncate()`.
+- **Result:** Self-healing startup that preserves all committed operations without manual administrative intervention.
+
 

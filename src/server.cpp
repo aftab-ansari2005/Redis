@@ -47,6 +47,7 @@
 #include "dlist.h"
 #include "heap.h"
 #include "thread_pool.h"
+#include "aof.h"
 
 // --------------------------------------------------------------------------
 // WSAPoll compatibility shim for MinGW.
@@ -161,6 +162,14 @@ static bool entry_eq(HNode *lhs, HNode *rhs) {
 // The global key-value store and TTL min-heap.
 static HMap g_map = {};
 static std::vector<HeapItem> g_heap;
+AofState g_aof = {};
+
+// Wall-clock time in milliseconds (Unix epoch) for absolute AOF timestamps
+static uint64_t get_wall_clock_ms() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+}
 
 // Monotonic clock reading in microseconds
 static uint64_t get_monotonic_usec() {
@@ -406,6 +415,7 @@ static void do_set(const std::vector<std::string> &cmd, std::string &out) {
     }
 
     resp_out_str(out, "OK");
+    aof_append({"SET", cmd[1], cmd[2]});
 }
 
 static void do_del(const std::vector<std::string> &cmd, std::string &out) {
@@ -415,12 +425,19 @@ static void do_del(const std::vector<std::string> &cmd, std::string &out) {
     }
 
     int64_t count = 0;
+    std::vector<std::string> deleted_keys;
     for (size_t i = 1; i < cmd.size(); i++) {
         Entry *ent = get_live_entry(cmd[i]);
         if (ent) {
             detach_and_free_entry(ent);
             count++;
+            deleted_keys.push_back(cmd[i]);
         }
+    }
+    if (count > 0) {
+        std::vector<std::string> aof_del = {"DEL"};
+        aof_del.insert(aof_del.end(), deleted_keys.begin(), deleted_keys.end());
+        aof_append(aof_del);
     }
     resp_out_int(out, count);
 }
@@ -498,7 +515,13 @@ static void do_zadd(const std::vector<std::string> &cmd, std::string &out) {
         }
     }
     
+    ZNode *existing = zset_lookup(ent->zset, cmd[3].data(), cmd[3].size());
+    double old_score = existing ? existing->score : 0;
+    bool was_present = (existing != NULL);
     bool added = zset_add(ent->zset, cmd[3].data(), cmd[3].size(), score);
+    if (added || (was_present && old_score != score)) {
+        aof_append({"ZADD", cmd[1], cmd[2], cmd[3]});
+    }
     resp_out_int(out, added ? 1 : 0);
 }
 
@@ -546,6 +569,7 @@ static void do_zrem(const std::vector<std::string> &cmd, std::string &out) {
     ZNode *zn = zset_pop(ent->zset, cmd[2].data(), cmd[2].size());
     if (zn) {
         delete zn;
+        aof_append({"ZREM", cmd[1], cmd[2]});
         resp_out_int(out, 1);
     } else {
         resp_out_int(out, 0);
@@ -636,6 +660,7 @@ static void do_expire(const std::vector<std::string> &cmd, std::string &out) {
 
     if (ttl_sec <= 0) {
         detach_and_free_entry(ent);
+        aof_append({"DEL", cmd[1]});
         resp_out_int(out, 1);
         return;
     }
@@ -648,6 +673,10 @@ static void do_expire(const std::vector<std::string> &cmd, std::string &out) {
     } else {
         heap_insert(g_heap, expire_us, &ent->heap_idx);
     }
+
+    uint64_t now_wall_ms = get_wall_clock_ms();
+    uint64_t expire_at_ms = now_wall_ms + (uint64_t)ttl_sec * 1000ULL;
+    aof_append({"PEXPIREAT", cmd[1], std::to_string(expire_at_ms)});
 
     resp_out_int(out, 1);
 }
@@ -674,6 +703,7 @@ static void do_pexpire(const std::vector<std::string> &cmd, std::string &out) {
 
     if (ttl_ms <= 0) {
         detach_and_free_entry(ent);
+        aof_append({"DEL", cmd[1]});
         resp_out_int(out, 1);
         return;
     }
@@ -686,6 +716,10 @@ static void do_pexpire(const std::vector<std::string> &cmd, std::string &out) {
     } else {
         heap_insert(g_heap, expire_us, &ent->heap_idx);
     }
+
+    uint64_t now_wall_ms = get_wall_clock_ms();
+    uint64_t expire_at_ms = now_wall_ms + (uint64_t)ttl_ms;
+    aof_append({"PEXPIREAT", cmd[1], std::to_string(expire_at_ms)});
 
     resp_out_int(out, 1);
 }
@@ -748,6 +782,48 @@ static void do_pttl(const std::vector<std::string> &cmd, std::string &out) {
     resp_out_int(out, remain_ms);
 }
 
+static void do_pexpireat(const std::vector<std::string> &cmd, std::string &out) {
+    if (cmd.size() != 3) {
+        resp_out_err(out, "ERR wrong number of arguments for 'pexpireat' command");
+        return;
+    }
+
+    uint64_t expire_at_ms = 0;
+    try {
+        expire_at_ms = std::stoull(cmd[2]);
+    } catch (...) {
+        resp_out_err(out, "ERR value is not an integer or out of range");
+        return;
+    }
+
+    Entry *ent = get_live_entry(cmd[1]);
+    if (!ent) {
+        resp_out_int(out, 0);
+        return;
+    }
+
+    uint64_t now_ms = get_wall_clock_ms();
+    if (expire_at_ms <= now_ms) {
+        detach_and_free_entry(ent);
+        aof_append({"DEL", cmd[1]});
+        resp_out_int(out, 1);
+        return;
+    }
+
+    uint64_t remaining_ms = expire_at_ms - now_ms;
+    uint64_t now_us = get_monotonic_usec();
+    uint64_t expire_us = now_us + remaining_ms * 1000ULL;
+
+    if (ent->heap_idx != (size_t)-1) {
+        heap_update_val(g_heap, ent->heap_idx, expire_us);
+    } else {
+        heap_insert(g_heap, expire_us, &ent->heap_idx);
+    }
+
+    aof_append({"PEXPIREAT", cmd[1], cmd[2]});
+    resp_out_int(out, 1);
+}
+
 static void do_persist(const std::vector<std::string> &cmd, std::string &out) {
     if (cmd.size() != 2) {
         resp_out_err(out, "ERR wrong number of arguments for 'persist' command");
@@ -766,6 +842,8 @@ static void do_persist(const std::vector<std::string> &cmd, std::string &out) {
     }
 
     heap_delete(g_heap, ent->heap_idx);
+    ent->heap_idx = (size_t)-1;
+    aof_append({"PERSIST", cmd[1]});
     resp_out_int(out, 1);
 }
 
@@ -908,6 +986,8 @@ static void do_request(const std::vector<std::string> &cmd, std::string &out, bo
         do_pttl(cmd, out);
     } else if (c == "PERSIST") {
         do_persist(cmd, out);
+    } else if (c == "PEXPIREAT") {
+        do_pexpireat(cmd, out);
     } else if (c == "ZADD") {
         do_zadd(cmd, out);
     } else if (c == "ZSCORE") {
@@ -1069,9 +1149,20 @@ static void conn_accept(SOCKET listen_fd, std::vector<Conn *> &connections) {
 // ==========================================================================
 // MAIN — the event loop
 // ==========================================================================
-int main() {
+int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+
+    std::string aof_filename = "appendonly.aof";
+    int port = 1234;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--aof") == 0 && i + 1 < argc) {
+            aof_filename = argv[++i];
+        } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+            port = atoi(argv[++i]);
+        }
+    }
+
     // --- Winsock init ---
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -1092,7 +1183,7 @@ int main() {
 
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(1234);
+    addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
@@ -1108,9 +1199,23 @@ int main() {
     // Initialize background thread pool with 4 workers for async deallocations
     thread_pool_init(&g_tp, 4);
 
-    printf("Server listening on 127.0.0.1:1234 (event loop + thread pool mode) ...\n");
-
     dlist_init(&g_idle_list);
+
+    // Replay existing AOF state before serving live client traffic
+    aof_load(aof_filename, [](const std::vector<std::string> &cmd) {
+        std::string dummy_out;
+        bool dummy_close = false;
+        do_request(cmd, dummy_out, dummy_close);
+    });
+
+    // Open AOF in append mode
+    if (!aof_init(aof_filename, AOF_FSYNC_ALWAYS)) {
+        fprintf(stderr, "[aof] Failed to initialize AOF '%s'\n", aof_filename.c_str());
+    }
+
+    printf("Server listening on 127.0.0.1:%d (AOF: %s, always-fsync) ...\n",
+           port, aof_filename.c_str());
+
     std::vector<Conn *> connections;
 
     // ======================================================================

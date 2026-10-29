@@ -4,7 +4,7 @@ LDFLAGS = -lws2_32
 SRCDIR = src
 TESTDIR = tests
 
-all: server.exe client.exe test_oversized.exe test_concurrent.exe test_commands.exe test_hashtable.exe test_avl.exe test_zset.exe test_dlist.exe test_timers.exe test_heap.exe test_ttl.exe test_thread_pool.exe test_lazyfree.exe
+all: server.exe client.exe test_oversized.exe test_concurrent.exe test_commands.exe test_hashtable.exe test_avl.exe test_zset.exe test_dlist.exe test_timers.exe test_heap.exe test_ttl.exe test_thread_pool.exe test_lazyfree.exe test_aof.exe
 
 hashtable.o: $(SRCDIR)/hashtable.cpp $(SRCDIR)/hashtable.h
 	$(CXX) $(CXXFLAGS) -c -o $@ $(SRCDIR)/hashtable.cpp
@@ -21,7 +21,7 @@ heap.o: $(SRCDIR)/heap.cpp $(SRCDIR)/heap.h
 thread_pool.o: $(SRCDIR)/thread_pool.cpp $(SRCDIR)/thread_pool.h
 	$(CXX) $(CXXFLAGS) -c -o $@ $(SRCDIR)/thread_pool.cpp
 
-server.exe: $(SRCDIR)/server.cpp $(SRCDIR)/hashtable.h $(SRCDIR)/resp.h $(SRCDIR)/avl.h $(SRCDIR)/zset.h $(SRCDIR)/dlist.h $(SRCDIR)/heap.h $(SRCDIR)/thread_pool.h hashtable.o avl.o zset.o heap.o thread_pool.o
+server.exe: $(SRCDIR)/server.cpp $(SRCDIR)/hashtable.h $(SRCDIR)/resp.h $(SRCDIR)/avl.h $(SRCDIR)/zset.h $(SRCDIR)/dlist.h $(SRCDIR)/heap.h $(SRCDIR)/thread_pool.h $(SRCDIR)/aof.h hashtable.o avl.o zset.o heap.o thread_pool.o
 	$(CXX) $(CXXFLAGS) -o $@ $(SRCDIR)/server.cpp hashtable.o avl.o zset.o heap.o thread_pool.o $(LDFLAGS)
 
 client.exe: $(SRCDIR)/client.cpp $(SRCDIR)/resp.h
@@ -62,6 +62,9 @@ test_thread_pool.exe: $(TESTDIR)/test_thread_pool.cpp $(SRCDIR)/thread_pool.h th
 
 test_lazyfree.exe: $(TESTDIR)/test_lazyfree.cpp $(SRCDIR)/resp.h
 	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_lazyfree.cpp $(LDFLAGS)
+
+test_aof.exe: $(TESTDIR)/test_aof.cpp $(SRCDIR)/resp.h $(SRCDIR)/aof.h
+	$(CXX) $(CXXFLAGS) -o $@ $(TESTDIR)/test_aof.cpp $(LDFLAGS)
 
 clean:
 	-del /Q *.exe *.o 2>NUL
