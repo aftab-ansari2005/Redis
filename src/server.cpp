@@ -22,6 +22,7 @@
 //   [4 bytes: payload length, little-endian uint32] [payload bytes]
 //   The payload is now a single serialized typed value (see serialization.h).
 
+#ifdef _WIN32
 // Ensure WSAPoll and related constants are available (Windows Vista+)
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
@@ -34,6 +35,25 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define SOCKET_ERROR   (-1)
+#define closesocket(s) close(s)
+#define WSAGetLastError() errno
+#define WSAEWOULDBLOCK EWOULDBLOCK
+typedef struct pollfd WSAPOLLFD;
+#define WSAPoll(pfd, nfds, timeout) poll(pfd, nfds, timeout)
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -51,6 +71,7 @@
 #include "thread_pool.h"
 #include "aof.h"
 
+#ifdef _WIN32
 // --------------------------------------------------------------------------
 // WSAPoll compatibility shim for MinGW.
 //
@@ -84,6 +105,7 @@ extern "C" {
     WINSOCK_API_LINKAGE int WSAAPI WSAPoll(
         WSAPOLLFD *fdArray, ULONG fds, INT timeout);
 }
+#endif
 #endif
 
 // --------------------------------------------------------------------------
@@ -483,8 +505,10 @@ static void process_timers() {
 }
 
 static void die(const char *msg) {
-    fprintf(stderr, "[error] %s (WSA error: %d)\n", msg, WSAGetLastError());
+    fprintf(stderr, "[error] %s (error code: %d)\n", msg, WSAGetLastError());
+#ifdef _WIN32
     WSACleanup();
+#endif
     exit(1);
 }
 
@@ -492,10 +516,17 @@ static void die(const char *msg) {
 // set_nonblocking — put a socket into non-blocking mode.
 // --------------------------------------------------------------------------
 static void set_nonblocking(SOCKET fd) {
+#ifdef _WIN32
     u_long mode = 1;   // 1 = enable non-blocking
     if (ioctlsocket(fd, FIONBIO, &mode) != 0) {
         die("ioctlsocket(FIONBIO)");
     }
+#else
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        die("fcntl(O_NONBLOCK)");
+    }
+#endif
 }
 
 // Forward declarations
@@ -1961,12 +1992,14 @@ int main(int argc, char **argv) {
         }
     }
 
+#ifdef _WIN32
     // --- Winsock init ---
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         fprintf(stderr, "WSAStartup failed: %d\n", WSAGetLastError());
         return 1;
     }
+#endif
 
     SOCKET listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd == INVALID_SOCKET) {
@@ -2100,6 +2133,8 @@ int main(int argc, char **argv) {
 
     // Cleanup — unreachable in the infinite loop, but good practice
     closesocket(listen_fd);
+#ifdef _WIN32
     WSACleanup();
+#endif
     return 0;
 }

@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test-linux:
+    name: Build & Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Compile Core Server and Data Structure Tests
+        run: make server test
+
+      - name: Run Unit Tests
+        run: make test
+
+  build-and-test-windows:
+    name: Build & Test (Windows MinGW)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MinGW
+        uses: egor-tensin/setup-mingw@v2
+        with:
+          platform: x64
+
+      - name: Compile All Binaries
+        run: mingw32-make all
+
+      - name: Run Isolated Data Structure Tests
+        run: mingw32-make test
+
+      - name: Run Persistence Tests (AOF Replay, Crash Repair, Compaction)
+        run: .\test_aof.exe
+
+      - name: Run Transaction Tests (MULTI / EXEC / DISCARD)
+        run: .\test_transactions.exe
+
+      - name: Run Pub/Sub Tests (Fan-Out, Pattern Match, Buffer Limit)
+        run: .\test_pubsub.exe
+
