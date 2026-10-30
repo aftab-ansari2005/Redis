@@ -41,6 +41,8 @@
 #include <chrono>
 #include <vector>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include "hashtable.h"
 #include "resp.h"
 #include "zset.h"
@@ -271,7 +273,121 @@ struct Conn {
     bool tx_abort = false;
     std::vector<QueuedCmd> tx_queue;
     size_t tx_queued_bytes = 0;
+
+    // Pub/Sub subscription state
+    std::unordered_set<std::string> channels;
+    std::unordered_set<std::string> patterns;
+
+    bool is_subscribed() const {
+        return !channels.empty() || !patterns.empty();
+    }
 };
+
+// --------------------------------------------------------------------------
+// Pub/Sub Globals & Helpers
+// --------------------------------------------------------------------------
+static const size_t k_pubsub_max_wbuf = 4 * 1024 * 1024; // 4 MB limit for slow consumers
+
+struct PubSubPattern {
+    Conn *conn = NULL;
+    std::string pattern;
+};
+
+static std::unordered_map<std::string, std::unordered_set<Conn *>> g_pubsub_channels;
+static std::vector<PubSubPattern> g_pubsub_patterns;
+
+// Glob pattern matching helper
+static bool glob_match(const char *p, size_t plen, const char *s, size_t slen) {
+    while (plen) {
+        switch (p[0]) {
+        case '*':
+            while (plen > 1 && p[1] == '*') {
+                p++;
+                plen--;
+            }
+            if (plen == 1) return true;
+            while (slen) {
+                if (glob_match(p + 1, plen - 1, s, slen)) return true;
+                s++;
+                slen--;
+            }
+            return false;
+        case '?':
+            if (slen == 0) return false;
+            s++;
+            slen--;
+            break;
+        case '[': {
+            p++;
+            plen--;
+            bool invert = false;
+            if (plen && p[0] == '^') {
+                invert = true;
+                p++;
+                plen--;
+            }
+            bool match = false;
+            if (slen == 0) return false;
+            char c = *s++;
+            slen--;
+            while (plen && p[0] != ']') {
+                if (plen >= 3 && p[1] == '-') {
+                    if (c >= p[0] && c <= p[2]) match = true;
+                    p += 3;
+                    plen -= 3;
+                } else {
+                    if (c == p[0]) match = true;
+                    p++;
+                    plen--;
+                }
+            }
+            if (invert) match = !match;
+            if (!match) return false;
+            break;
+        }
+        case '\\':
+            if (plen >= 2) {
+                p++;
+                plen--;
+            }
+            /* fall through */
+        default:
+            if (slen == 0 || p[0] != s[0]) return false;
+            s++;
+            slen--;
+            break;
+        }
+        p++;
+        plen--;
+    }
+    return slen == 0;
+}
+
+static void pubsub_clean_conn(Conn *conn) {
+    if (!conn->is_subscribed()) return;
+
+    for (const std::string &ch : conn->channels) {
+        auto it = g_pubsub_channels.find(ch);
+        if (it != g_pubsub_channels.end()) {
+            it->second.erase(conn);
+            if (it->second.empty()) {
+                g_pubsub_channels.erase(it);
+            }
+        }
+    }
+    conn->channels.clear();
+
+    if (!conn->patterns.empty()) {
+        for (auto pit = g_pubsub_patterns.begin(); pit != g_pubsub_patterns.end(); ) {
+            if (pit->conn == conn) {
+                pit = g_pubsub_patterns.erase(pit);
+            } else {
+                ++pit;
+            }
+        }
+        conn->patterns.clear();
+    }
+}
 
 // --------------------------------------------------------------------------
 // Idle timers and timeouts (Chapter 12)
@@ -295,13 +411,18 @@ static int next_timer_ms() {
     uint64_t now_us = get_monotonic_usec();
     uint64_t next_us = (uint64_t)-1;
 
-    // Timer source 1: Idle connection timeout (head of intrusive list)
-    if (!dlist_empty(&g_idle_list)) {
-        Conn *conn = container_of(g_idle_list.next, Conn, idle_list);
-        uint64_t conn_deadline = conn->idle_start + k_idle_timeout_us;
-        if (conn_deadline < next_us) {
-            next_us = conn_deadline;
+    // Timer source 1: Idle connection timeout (earliest non-subscribed connection)
+    DList *cur = g_idle_list.next;
+    while (cur != &g_idle_list) {
+        Conn *conn = container_of(cur, Conn, idle_list);
+        if (!conn->is_subscribed()) {
+            uint64_t conn_deadline = conn->idle_start + k_idle_timeout_us;
+            if (conn_deadline < next_us) {
+                next_us = conn_deadline;
+            }
+            break;
         }
+        cur = cur->next;
     }
 
     // Timer source 2: Key TTL expiration (root of binary min-heap)
@@ -333,13 +454,17 @@ static int next_timer_ms() {
 static void process_timers() {
     uint64_t now_us = get_monotonic_usec();
 
-    // 1. Idle connection sweep
-    while (!dlist_empty(&g_idle_list)) {
-        Conn *conn = container_of(g_idle_list.next, Conn, idle_list);
+    // 1. Idle connection sweep (skipping clients in pub/sub subscribed mode)
+    DList *cur = g_idle_list.next;
+    while (cur != &g_idle_list) {
+        Conn *conn = container_of(cur, Conn, idle_list);
+        DList *next_node = cur->next;
+        if (conn->is_subscribed()) {
+            cur = next_node;
+            continue;
+        }
         uint64_t next_us = conn->idle_start + k_idle_timeout_us;
         if (next_us > now_us) {
-            // Because connections are ordered monotonically by idle_start,
-            // if the head has not timed out, no subsequent connection has either.
             break;
         }
         printf("Connection fd=%u timed out after %u ms idle.\n",
@@ -347,6 +472,7 @@ static void process_timers() {
                (unsigned)((now_us - conn->idle_start) / 1000));
         conn->want_close = true;
         dlist_detach(&conn->idle_list);
+        cur = next_node;
     }
 
     // 2. Active TTL key expiration sweep (min-heap root eviction)
@@ -1066,6 +1192,217 @@ static void do_rewriteaof(const std::vector<std::string> &cmd, std::string &out)
     resp_out_str(out, "OK");
 }
 
+// --------------------------------------------------------------------------
+// Pub/Sub Command Handlers
+// --------------------------------------------------------------------------
+
+static void do_subscribe(Conn *conn, const std::vector<std::string> &cmd, std::string &out) {
+    if (!conn) return;
+    if (cmd.size() < 2) {
+        resp_out_err(out, "ERR wrong number of arguments for 'subscribe' command");
+        return;
+    }
+
+    for (size_t i = 1; i < cmd.size(); i++) {
+        const std::string &channel = cmd[i];
+        if (conn->channels.find(channel) == conn->channels.end()) {
+            conn->channels.insert(channel);
+            g_pubsub_channels[channel].insert(conn);
+        }
+        size_t total_subs = conn->channels.size() + conn->patterns.size();
+        resp_out_arr_header(out, 3);
+        resp_out_bulk(out, "subscribe");
+        resp_out_bulk(out, channel);
+        resp_out_int(out, (int64_t)total_subs);
+    }
+}
+
+static void do_unsubscribe(Conn *conn, const std::vector<std::string> &cmd, std::string &out) {
+    if (!conn) return;
+    if (cmd.size() == 1) {
+        if (conn->channels.empty()) {
+            size_t total_subs = conn->patterns.size();
+            resp_out_arr_header(out, 3);
+            resp_out_bulk(out, "unsubscribe");
+            resp_out_null_bulk(out);
+            resp_out_int(out, (int64_t)total_subs);
+            return;
+        }
+        std::vector<std::string> chs(conn->channels.begin(), conn->channels.end());
+        for (const std::string &channel : chs) {
+            conn->channels.erase(channel);
+            auto it = g_pubsub_channels.find(channel);
+            if (it != g_pubsub_channels.end()) {
+                it->second.erase(conn);
+                if (it->second.empty()) {
+                    g_pubsub_channels.erase(it);
+                }
+            }
+            size_t total_subs = conn->channels.size() + conn->patterns.size();
+            resp_out_arr_header(out, 3);
+            resp_out_bulk(out, "unsubscribe");
+            resp_out_bulk(out, channel);
+            resp_out_int(out, (int64_t)total_subs);
+        }
+        return;
+    }
+
+    for (size_t i = 1; i < cmd.size(); i++) {
+        const std::string &channel = cmd[i];
+        if (conn->channels.find(channel) != conn->channels.end()) {
+            conn->channels.erase(channel);
+            auto it = g_pubsub_channels.find(channel);
+            if (it != g_pubsub_channels.end()) {
+                it->second.erase(conn);
+                if (it->second.empty()) {
+                    g_pubsub_channels.erase(it);
+                }
+            }
+        }
+        size_t total_subs = conn->channels.size() + conn->patterns.size();
+        resp_out_arr_header(out, 3);
+        resp_out_bulk(out, "unsubscribe");
+        resp_out_bulk(out, channel);
+        resp_out_int(out, (int64_t)total_subs);
+    }
+}
+
+static void do_psubscribe(Conn *conn, const std::vector<std::string> &cmd, std::string &out) {
+    if (!conn) return;
+    if (cmd.size() < 2) {
+        resp_out_err(out, "ERR wrong number of arguments for 'psubscribe' command");
+        return;
+    }
+
+    for (size_t i = 1; i < cmd.size(); i++) {
+        const std::string &pattern = cmd[i];
+        if (conn->patterns.find(pattern) == conn->patterns.end()) {
+            conn->patterns.insert(pattern);
+            g_pubsub_patterns.push_back({conn, pattern});
+        }
+        size_t total_subs = conn->channels.size() + conn->patterns.size();
+        resp_out_arr_header(out, 3);
+        resp_out_bulk(out, "psubscribe");
+        resp_out_bulk(out, pattern);
+        resp_out_int(out, (int64_t)total_subs);
+    }
+}
+
+static void do_punsubscribe(Conn *conn, const std::vector<std::string> &cmd, std::string &out) {
+    if (!conn) return;
+    if (cmd.size() == 1) {
+        if (conn->patterns.empty()) {
+            size_t total_subs = conn->channels.size();
+            resp_out_arr_header(out, 3);
+            resp_out_bulk(out, "punsubscribe");
+            resp_out_null_bulk(out);
+            resp_out_int(out, (int64_t)total_subs);
+            return;
+        }
+        std::vector<std::string> pats(conn->patterns.begin(), conn->patterns.end());
+        for (const std::string &pattern : pats) {
+            conn->patterns.erase(pattern);
+            for (auto it = g_pubsub_patterns.begin(); it != g_pubsub_patterns.end(); ) {
+                if (it->conn == conn && it->pattern == pattern) {
+                    it = g_pubsub_patterns.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            size_t total_subs = conn->channels.size() + conn->patterns.size();
+            resp_out_arr_header(out, 3);
+            resp_out_bulk(out, "punsubscribe");
+            resp_out_bulk(out, pattern);
+            resp_out_int(out, (int64_t)total_subs);
+        }
+        return;
+    }
+
+    for (size_t i = 1; i < cmd.size(); i++) {
+        const std::string &pattern = cmd[i];
+        if (conn->patterns.find(pattern) != conn->patterns.end()) {
+            conn->patterns.erase(pattern);
+            for (auto it = g_pubsub_patterns.begin(); it != g_pubsub_patterns.end(); ) {
+                if (it->conn == conn && it->pattern == pattern) {
+                    it = g_pubsub_patterns.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        size_t total_subs = conn->channels.size() + conn->patterns.size();
+        resp_out_arr_header(out, 3);
+        resp_out_bulk(out, "punsubscribe");
+        resp_out_bulk(out, pattern);
+        resp_out_int(out, (int64_t)total_subs);
+    }
+}
+
+static void do_publish(const std::vector<std::string> &cmd, std::string &out) {
+    if (cmd.size() != 3) {
+        resp_out_err(out, "ERR wrong number of arguments for 'publish' command");
+        return;
+    }
+
+    const std::string &channel = cmd[1];
+    const std::string &message = cmd[2];
+    int64_t receivers = 0;
+
+    // 1. Deliver to exact channel subscribers
+    auto it = g_pubsub_channels.find(channel);
+    if (it != g_pubsub_channels.end()) {
+        std::string push_msg;
+        resp_out_arr_header(push_msg, 3);
+        resp_out_bulk(push_msg, "message");
+        resp_out_bulk(push_msg, channel);
+        resp_out_bulk(push_msg, message);
+
+        for (Conn *sub : it->second) {
+            if (sub->want_close) continue;
+
+            size_t pending = sub->wbuf.size() - sub->wbuf_sent;
+            if (pending + push_msg.size() > k_pubsub_max_wbuf) {
+                fprintf(stderr, "[pubsub] Dropping slow subscriber fd=%u: buffer limit exceeded.\n", (unsigned)sub->fd);
+                sub->want_close = true;
+                continue;
+            }
+
+            sub->wbuf.append(push_msg);
+            sub->state = STATE_WRITE;
+            receivers++;
+        }
+    }
+
+    // 2. Deliver to pattern subscribers
+    if (!g_pubsub_patterns.empty()) {
+        for (const auto &entry : g_pubsub_patterns) {
+            if (entry.conn->want_close) continue;
+            if (glob_match(entry.pattern.c_str(), entry.pattern.size(), channel.c_str(), channel.size())) {
+                std::string pmsg;
+                resp_out_arr_header(pmsg, 4);
+                resp_out_bulk(pmsg, "pmessage");
+                resp_out_bulk(pmsg, entry.pattern);
+                resp_out_bulk(pmsg, channel);
+                resp_out_bulk(pmsg, message);
+
+                size_t pending = entry.conn->wbuf.size() - entry.conn->wbuf_sent;
+                if (pending + pmsg.size() > k_pubsub_max_wbuf) {
+                    fprintf(stderr, "[pubsub] Dropping slow pattern subscriber fd=%u: buffer limit exceeded.\n", (unsigned)entry.conn->fd);
+                    entry.conn->want_close = true;
+                    continue;
+                }
+
+                entry.conn->wbuf.append(pmsg);
+                entry.conn->state = STATE_WRITE;
+                receivers++;
+            }
+        }
+    }
+
+    // Reply to publisher with number of receivers (Pub/Sub is fire-and-forget: NOT logged in AOF)
+    resp_out_int(out, receivers);
+}
+
 // Forward declaration for recursive execution in EXEC
 static void do_request(Conn *conn, const std::vector<std::string> &cmd, std::string &out, bool &want_close);
 
@@ -1208,7 +1545,24 @@ static bool validate_cmd_syntax(const std::vector<std::string> &cmd, std::string
         }
         return true;
     }
-    if (c == "CONFIG" || c == "CLIENT" || c == "COMMAND" || c == "HELLO" || c == "QUIT" || c == "BGREWRITEAOF" || c == "REWRITEAOF") {
+    if (c == "CONFIG" || c == "CLIENT" || c == "COMMAND" || c == "HELLO" || c == "QUIT" || c == "BGREWRITEAOF" || c == "REWRITEAOF" || c == "RESET") {
+        return true;
+    }
+    if (c == "SUBSCRIBE" || c == "PSUBSCRIBE") {
+        if (cmd.size() < 2) {
+            err_msg = "ERR wrong number of arguments for '" + cmd[0] + "' command";
+            return false;
+        }
+        return true;
+    }
+    if (c == "UNSUBSCRIBE" || c == "PUNSUBSCRIBE") {
+        return true;
+    }
+    if (c == "PUBLISH") {
+        if (cmd.size() != 3) {
+            err_msg = "ERR wrong number of arguments for 'publish' command";
+            return false;
+        }
         return true;
     }
 
@@ -1279,6 +1633,18 @@ static void do_request(Conn *conn, const std::vector<std::string> &cmd, std::str
     for (char &ch : c) ch = (char)toupper((unsigned char)ch);
 
     // ----------------------------------------------------------------------
+    // Subscribed Mode: Only allow (P)SUBSCRIBE, (P)UNSUBSCRIBE, PING, QUIT, RESET
+    // ----------------------------------------------------------------------
+    if (conn && conn->is_subscribed()) {
+        if (c != "SUBSCRIBE" && c != "UNSUBSCRIBE" &&
+            c != "PSUBSCRIBE" && c != "PUNSUBSCRIBE" &&
+            c != "PING" && c != "QUIT" && c != "RESET") {
+            resp_out_err(out, "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context");
+            return;
+        }
+    }
+
+    // ----------------------------------------------------------------------
     // Transaction Mode: Queuing
     // ----------------------------------------------------------------------
     if (conn && conn->in_multi) {
@@ -1347,6 +1713,16 @@ static void do_request(Conn *conn, const std::vector<std::string> &cmd, std::str
     }
 
     if (c == "PING") {
+        if (conn && conn->is_subscribed()) {
+            resp_out_arr_header(out, 2);
+            resp_out_bulk(out, "pong");
+            if (cmd.size() > 1) {
+                resp_out_bulk(out, cmd[1]);
+            } else {
+                resp_out_bulk(out, "");
+            }
+            return;
+        }
         do_ping(cmd, out);
     } else if (c == "ECHO") {
         do_echo(cmd, out);
@@ -1361,6 +1737,25 @@ static void do_request(Conn *conn, const std::vector<std::string> &cmd, std::str
         resp_out_err(out, "ERR unknown command 'HELLO'");
     } else if (c == "CLIENT") {
         resp_out_str(out, "OK");
+    } else if (c == "SUBSCRIBE") {
+        do_subscribe(conn, cmd, out);
+    } else if (c == "UNSUBSCRIBE") {
+        do_unsubscribe(conn, cmd, out);
+    } else if (c == "PSUBSCRIBE") {
+        do_psubscribe(conn, cmd, out);
+    } else if (c == "PUNSUBSCRIBE") {
+        do_punsubscribe(conn, cmd, out);
+    } else if (c == "PUBLISH") {
+        do_publish(cmd, out);
+    } else if (c == "RESET") {
+        if (conn) {
+            pubsub_clean_conn(conn);
+            conn->in_multi = false;
+            conn->tx_abort = false;
+            conn->tx_queue.clear();
+            conn->tx_queued_bytes = 0;
+        }
+        resp_out_str(out, "RESET");
     } else if (c == "GET") {
         do_get(cmd, out);
     } else if (c == "SET") {
@@ -1692,6 +2087,7 @@ int main(int argc, char **argv) {
                 Conn *conn = connections[i];
                 printf("Closing connection fd=%u.\n",
                        (unsigned)conn->fd);
+                pubsub_clean_conn(conn);
                 dlist_detach(&conn->idle_list);
                 closesocket(conn->fd);
 
