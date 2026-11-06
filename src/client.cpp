@@ -125,13 +125,30 @@ int main(int argc, char *argv[]) {
         die("resp_send_cmd()");
     }
 
-    // Read and pretty-print the response
-    RespValue resp;
-    if (resp_read_val(fd, resp) != 0) {
-        die("resp_read_val()");
-    }
+    std::string upper_cmd = cmd[0];
+    for (char &c : upper_cmd) c = (char)toupper((unsigned char)c);
 
-    print_resp_value(resp, 0);
+    // For SUBSCRIBE and PSUBSCRIBE, stay connected and continuously print incoming messages
+    if (upper_cmd == "SUBSCRIBE" || upper_cmd == "PSUBSCRIBE") {
+        printf("Reading messages... (press Ctrl-C to quit)\n");
+        std::string buf;
+        while (true) {
+            RespValue msg;
+            if (resp_read_val(fd, buf, msg) != 0) {
+                printf("\nDisconnected from server.\n");
+                break;
+            }
+            print_resp_value(msg, 0);
+            printf("\n");
+        }
+    } else {
+        // Read and pretty-print the response for standard single-turn commands
+        RespValue resp;
+        if (resp_read_val(fd, resp) != 0) {
+            die("resp_read_val()");
+        }
+        print_resp_value(resp, 0);
+    }
 
     closesocket(fd);
     WSACleanup();

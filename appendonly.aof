@@ -1,0 +1,21 @@
+*3
+$3
+SET
+$5
+mykey
+$11
+hello world
+*3
+$9
+PEXPIREAT
+$5
+mykey
+$13
+1793969307713
+*3
+$3
+SET
+$4
+test
+$3
+123
